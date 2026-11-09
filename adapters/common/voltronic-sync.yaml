@@ -1,0 +1,355 @@
+# Contract surface (bi_* scripts) shared by the Voltronic-family adapters.
+#
+# The core states intent through these scripts; this package turns it into the
+# adapter's own entities, which every Voltronic adapter declares with the same ids:
+#   select  energy_use_mode          "SBU (Solar/battery/utility)" / "SUB (...)" / "UTI (...)"
+#   select  charger_source_priority  "SNU (Solar and utility)" / "OSO (Solar only)"
+#   select  solar_use_aim            "LBU (...)" / "BLU (...)"          (only if cap_solar_aim)
+#   number  grid_charger_amps        grid charge current limit, A
+#   number  batt_stop_chg / batt_stop_dischg   charge / discharge stop, V (or % if stop_by_soc)
+# and updates the global bi_data_ms on every fresh SoC read.
+#
+# Included by an adapter with its capabilities:
+#   packages:
+#     sync: !include
+#       file: common/voltronic-sync.yaml
+#       vars: { adapter_name: "MUST PV18", cap_solar_aim: "1", cap_grid_only: "1",
+#               stop_by_soc: "0", writes_enabled: "1" }
+#
+#   cap_solar_aim   1 = has the LBU/BLU setting
+#   cap_grid_only   1 = has UTI (utility only); 0 = a grid-fed session uses SUB
+#   stop_by_soc     1 = the stop registers take SoC %; 0 = pack voltage
+#   writes_enabled  0 = untested adapter: nothing is ever written to the inverter
+#
+# Reconcile (docs/design/adapter-contract.md): the scripts only store what the core
+# wants. The core calls bi_sync once at the end of each pass (and after each user action),
+# so a burst of wishes reaches the inverter as one set of writes. bi_sync compares each
+# register with its read-back and writes only the ones
+# that differ, in a safe order, through one blackout::RegSync per register (wait for a
+# poll to show a write, 3 tries, then 10 min backoff). bi_sync also runs every 30 s, so a
+# value changed by hand or reset by the inverter (the MUST puts 80 A back after every
+# outage) is put right without a call from the core. Nothing runs while the inverter
+# data is stale or while Full Manual has the controls (hands_off).
+
+sensor:
+  # Actual state, read back, for the core's own decisions (Full Manual sag guard, the
+  # watchdog, relay-trip bookkeeping). 10 s, so they lag the 30 s poll by little.
+  - platform: template
+    id: bi_ctl_grid_charge_on
+    internal: true
+    name: "BI Grid charging on"
+    update_interval: 10s
+    accuracy_decimals: 0
+    lambda: |-
+      auto opt = id(charger_source_priority).current_option();
+      if (opt.empty()) return NAN;
+      // Anything but solar-only lets the charger take from the grid (SNU and CSO alike).
+      return opt == std::string("OSO (Solar only)") ? 0.0f : 1.0f;
+
+  - platform: template
+    id: bi_ctl_grid_charge_amps
+    internal: true
+    name: "BI Grid charge amps"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    update_interval: 10s
+    accuracy_decimals: 1
+    lambda: |-
+      return id(grid_charger_amps).state;
+
+  - platform: template
+    id: bi_ctl_stop_soc
+    internal: true
+    name: "BI Charge stop SoC"
+    unit_of_measurement: "%"
+    update_interval: 10s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(batt_stop_chg).state;
+      if (isnan(v)) return NAN;
+      return ${stop_by_soc} ? v : blackout::voltage_to_soc(v, ${battery_cells_s});
+
+  - platform: template
+    id: bi_ctl_discharge_stop_soc
+    internal: true
+    name: "BI Discharge stop SoC"
+    unit_of_measurement: "%"
+    update_interval: 10s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(batt_stop_dischg).state;
+      if (isnan(v)) return NAN;
+      return ${stop_by_soc} ? v : blackout::voltage_to_soc(v, ${battery_cells_s});
+
+globals:
+  - id: bi_data_ms         # millis() of the last fresh SoC read (set by the adapter)
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # What the core wants; -1 / NAN = nothing asked yet (or forgotten for Full Manual).
+  - id: bi_d_house         # 0 battery, 1 grid
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: bi_d_permit        # 0 grid charging off, 1 on
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: bi_d_session       # a grid charge session is running or paused (picks UTI by day)
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: bi_d_amps
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: bi_d_stop_soc
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: bi_d_dstop_soc
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+  - id: bi_d_solar         # 0 load first, 1 battery first
+    type: int
+    restore_value: no
+    initial_value: '-1'
+  - id: bi_rs_mode
+    type: blackout::RegSync
+    restore_value: no
+  - id: bi_rs_prio
+    type: blackout::RegSync
+    restore_value: no
+  - id: bi_rs_amps
+    type: blackout::RegSync
+    restore_value: no
+  - id: bi_rs_stop
+    type: blackout::RegSync
+    restore_value: no
+  - id: bi_rs_dstop
+    type: blackout::RegSync
+    restore_value: no
+  - id: bi_rs_aim
+    type: blackout::RegSync
+    restore_value: no
+
+script:
+  # The reconcile pass. Synchronous: one lambda, no delay or wait, so every bi_* call
+  # writes what it can before it returns, in the order below.
+  - id: bi_sync
+    then:
+      - lambda: |-
+          if (id(hands_off)) {
+            // Full Manual owns the controls. Forget the wishes, so leaving Full Manual
+            // replays nothing stale (a session's 20 A + SNU from before it, say); the
+            // core states them again on its next cycle.
+            id(bi_d_house) = -1;
+            id(bi_d_permit) = -1;
+            id(bi_d_amps) = NAN;
+            id(bi_d_stop_soc) = NAN;
+            id(bi_d_solar) = -1;
+            return;
+          }
+          if (!${writes_enabled}) {
+            static bool warned = false;
+            if (!warned) {
+              ESP_LOGW("adapter", "${adapter_name}: UNTESTED adapter, inverter writes are disabled "
+                       "(writes_enabled: \"0\"). Check every reading first, see the adapter header.");
+              warned = true;
+            }
+            return;
+          }
+          const uint32_t now = millis();
+          if (id(bi_data_ms) == 0 || now - id(bi_data_ms) > 150000UL) return;  // stale data
+          auto t = id(homeassistant_time).now();
+          const bool night = !t.is_valid() || t.hour >= ${night_start_hour} || t.hour < ${night_end_hour};
+
+          auto sync_amps = [&]() {
+            // During an outage the MUST resets the limit itself; it is written again on the
+            // way back, before the permission (see the order below).
+            if (isnan(id(bi_d_amps)) || !id(grid_present)) return;
+            const float want = id(bi_d_amps);
+            const float cur = id(grid_charger_amps).state;
+            const bool match = !isnan(cur) && fabsf(cur - want) < 0.5f;
+            if (!id(bi_rs_amps).due(match, want, now)) return;
+            auto call = id(grid_charger_amps).make_call();
+            call.set_value(want);
+            call.perform();
+            ESP_LOGI("adapter", "grid charge limit %.0f A -> %.0f A", cur, want);
+          };
+          auto sync_prio = [&]() {
+            if (id(bi_d_permit) < 0) return;
+            if (id(bi_d_permit) == 1) {
+              // Never open the charger while the limit is not in place: without grid (the
+              // MUST resets the limit to 80 A during an outage; it is written on the way
+              // back), or while the inverter still holds more than the wish.
+              const float lim = isnan(id(bi_d_amps)) ? (float) ${charge_amps_start} : id(bi_d_amps);
+              const float cur = id(grid_charger_amps).state;
+              if (!id(grid_present) || isnan(cur) || cur > lim + 0.5f) return;
+            }
+            const char *want = id(bi_d_permit) ? "SNU (Solar and utility)" : "OSO (Solar only)";
+            const bool match = id(charger_source_priority).current_option() == std::string(want);
+            if (!id(bi_rs_prio).due(match, (float) id(bi_d_permit), now)) return;
+            auto call = id(charger_source_priority).make_call();
+            call.set_option(want);
+            call.perform();
+            ESP_LOGI("adapter", "charger priority -> %s", want);
+          };
+          // Off: permission first, then the limit. On: the limit first — a permission ahead
+          // of it would charge at whatever the register holds (80 A after an outage).
+          if (id(bi_d_permit) == 1) { sync_amps(); sync_prio(); } else { sync_prio(); sync_amps(); }
+
+          if (id(bi_d_house) >= 0) {
+            // A grid-fed session runs on UTI by day where the inverter has it (the MUST does
+            // not grid-charge in SUB while its solar charger runs); SUB at night, without
+            // grid, or idle on the grid.
+            const char *want = "SBU (Solar/battery/utility)";
+            if (id(bi_d_house) == 1) {
+              want = (id(bi_d_session) && ${cap_grid_only} && !night && id(grid_present))
+                  ? "UTI (Utility only)" : "SUB (Solar/utility/battery)";
+            }
+            const float code = want[1] == 'B' ? 0.0f : want[2] == 'B' ? 1.0f : 2.0f;  // SBU / SUB / UTI
+            static float last_code = NAN;
+            if (code != last_code) { id(bi_rs_mode).reset(); last_code = code; }
+            const bool match = id(energy_use_mode).current_option() == std::string(want);
+            if (id(bi_rs_mode).due(match, code, now)) {
+              auto call = id(energy_use_mode).make_call();
+              call.set_option(want);
+              call.perform();
+              ESP_LOGI("adapter", "energy mode -> %s", want);
+            }
+          }
+
+          if (!isnan(id(bi_d_stop_soc))) {
+            const float want = ${stop_by_soc} ? id(bi_d_stop_soc)
+                : blackout::charge_stop_voltage(id(bi_d_stop_soc), ${battery_cells_s});
+            const float cur = id(batt_stop_chg).state;
+            const bool match = !isnan(cur) && fabsf(cur - want) < (${stop_by_soc} ? 0.6f : 0.1f);
+            if (id(bi_rs_stop).due(match, want, now)) {
+              auto call = id(batt_stop_chg).make_call();
+              call.set_value(want);
+              call.perform();
+              ESP_LOGI("adapter", "charge stop %.1f -> %.1f", cur, want);
+            }
+          }
+
+          if (!isnan(id(bi_d_dstop_soc))) {
+            const float want = ${stop_by_soc} ? id(bi_d_dstop_soc)
+                : blackout::soc_to_voltage(id(bi_d_dstop_soc), ${battery_cells_s});
+            const float cur = id(batt_stop_dischg).state;
+            const bool match = !isnan(cur) && fabsf(cur - want) < (${stop_by_soc} ? 0.6f : 0.1f);
+            if (id(bi_rs_dstop).due(match, want, now)) {
+              auto call = id(batt_stop_dischg).make_call();
+              call.set_value(want);
+              call.perform();
+              ESP_LOGI("adapter", "discharge stop %.1f -> %.1f", cur, want);
+            }
+          }
+
+          #if ${cap_solar_aim}
+          if (id(bi_d_solar) >= 0) {
+            // Never battery-first at night: the MUST freezes in bypass with BLU after dark.
+            const char *want = (!night && id(bi_d_solar) == 1)
+                ? "BLU (Battery, Load, Utility)" : "LBU (Load, Battery, Utility)";
+            const float code = want[0] == 'B' ? 1.0f : 0.0f;  // BLU / LBU
+            static float last_code = NAN;
+            if (code != last_code) { id(bi_rs_aim).reset(); last_code = code; }
+            const bool match = id(solar_use_aim).current_option() == std::string(want);
+            if (id(bi_rs_aim).due(match, code, now)) {
+              auto call = id(solar_use_aim).make_call();
+              call.set_option(want);
+              call.perform();
+              ESP_LOGI("adapter", "solar aim -> %s", want);
+            }
+          }
+          #endif
+
+  - id: bi_house
+    parameters:
+      source: int
+    then:
+      - lambda: |-
+          if (source != id(bi_d_house)) id(bi_rs_mode).reset();
+          id(bi_d_house) = source;
+
+  # Grid charging allowed or not; `session` marks a running or paused charge session.
+  - id: bi_grid_permit
+    parameters:
+      allow: bool    # not `on`: YAML reads that key as a boolean
+      session: bool
+    then:
+      - lambda: |-
+          if ((int) allow != id(bi_d_permit)) id(bi_rs_prio).reset();
+          if (session != id(bi_d_session)) id(bi_rs_mode).reset();
+          id(bi_d_permit) = allow ? 1 : 0;
+          id(bi_d_session) = session;
+
+  # The grid charge current limit. Never below charge_amps_start: "off" is the
+  # permission's job, and a 0 here is stored as the maximum by the MUST.
+  - id: bi_charge_limit
+    parameters:
+      amps: float
+    then:
+      - lambda: |-
+          float a = amps;
+          if (isnan(a) || a < ${charge_amps_start}) a = ${charge_amps_start};
+          if (a > ${charge_amps_max}) a = ${charge_amps_max};
+          if (isnan(id(bi_d_amps)) || fabsf(a - id(bi_d_amps)) > 0.05f) id(bi_rs_amps).reset();
+          id(bi_d_amps) = a;
+
+  - id: bi_charge_stop
+    parameters:
+      soc: float
+    then:
+      - lambda: |-
+          if (isnan(id(bi_d_stop_soc)) || fabsf(soc - id(bi_d_stop_soc)) > 0.05f) id(bi_rs_stop).reset();
+          id(bi_d_stop_soc) = soc;
+
+  - id: bi_discharge_stop
+    parameters:
+      soc: float
+    then:
+      - lambda: |-
+          if (isnan(id(bi_d_dstop_soc)) || fabsf(soc - id(bi_d_dstop_soc)) > 0.05f) id(bi_rs_dstop).reset();
+          id(bi_d_dstop_soc) = soc;
+
+  - id: bi_solar_priority
+    parameters:
+      target: int
+    then:
+      - lambda: |-
+          id(bi_d_solar) = target;
+
+  # Full Manual's sag guard: the current only, written directly (the manual path ignores
+  # hands_off), never below charge_amps_start, only on a real change.
+  - id: bi_manual_amps
+    parameters:
+      amps: float
+    then:
+      - lambda: |-
+          if (!${writes_enabled}) return;
+          if (id(bi_data_ms) == 0 || millis() - id(bi_data_ms) > 150000UL) return;
+          float a = amps;
+          if (isnan(a) || a < ${charge_amps_start}) a = ${charge_amps_start};
+          const float cur = id(grid_charger_amps).state;
+          if (!isnan(cur) && fabsf(a - cur) < 0.5f) return;
+          auto call = id(grid_charger_amps).make_call();
+          call.set_value(a);
+          call.perform();
+
+interval:
+  - interval: 30s
+    then:
+      - script.execute: bi_sync
+  # First fresh data after a boot: apply at once. A session restored at boot asks for
+  # 5 A + charger off, and the inverter is still charging at the pre-restart current.
+  - interval: 5s
+    then:
+      - lambda: |-
+          static bool done = false;
+          if (!done && id(bi_data_ms) != 0) {
+            done = true;
+            id(bi_sync).execute();
+          }

@@ -1,0 +1,265 @@
+# Default settings of the core: reserve, charge currents, grid protection, tariff hours,
+# battery. Every value here can be overridden in the device file's own `substitutions:`
+# (the device file wins). The numbers are the reference install's (MUST PV18, 16S LiFePO4
+# 190 Ah, a weak line in Ukraine); the comments say where each one came from.
+substitutions:
+  updates: 30s   # inverter poll interval
+  # Local time zone: the night tariff hours and the morning stop are wall-clock times.
+  timezone: Europe/Kyiv
+
+  # ============ RESERVE PARAMETERS ============
+  # The charge targets are NOT fixed SoC values any more. They are derived from how
+  # many hours of autonomy you want to hold in the battery, measured against the
+  # actual load. See "Energy Strategy" below.
+  #
+  #   Sun     - solar covers the day, battery is a night buffer. Small reserve.
+  #   Reserve - little sun / rolling blackouts. Battery works freely above the
+  #             reserve, grid only tops it back up. This is the everyday winter mode.
+  #   Backup  - shelling / unscheduled outages. Battery is held untouched at a high
+  #             fixed SoC and the grid carries the house. UPS behaviour.
+  reserve_hours_sun: "3"
+  reserve_hours_reserve: "6"
+  backup_target_soc: "90.0"
+
+  # How long a Reserve Autonomy Target written by Home Assistant stays trusted. Past
+  # this the device reverts to the strategy preset on its own, so a controller that
+  # dies mid-blackout cannot leave the reserve pinned near its ceiling forever.
+  reserve_override_ttl_hours: "12"
+
+  # ============ SELF-HEAL ============
+  # The api/wifi reboot timeouts are off (see there), so the device restarts itself only
+  # on these conditions. Minutes unless noted.
+  heal_api_dead_minutes: "10"        # WiFi up, Home Assistant not connected (was 20; a
+                                     # wedged stack every ~week cost 20 min unseen)
+  heal_wifi_dead_minutes: "30"       # WiFi down while the grid is up (router has power)
+  # WiFi down during an outage. Was 180 (router assumed off), but the router is on backup
+  # power, so a long WiFi loss in an outage is our own stack too. The clock survives the
+  # restart (RTC), and the streak backoff below still bounds a real router-off night to
+  # two restarts, then one per 3 h.
+  heal_wifi_dead_outage_minutes: "30"
+  heal_modbus_dead_minutes: "20"     # no SoC read from the inverter
+  # After this many API/WiFi restarts in a row that did not bring the connection back,
+  # restart at most every heal_backoff_minutes. The WiFi component reconnects on its
+  # own the moment the network returns; a restart only helps a wedged stack, and on
+  # 1-2 Nov (HA and router down 15 h) one every 30 min did nothing but harm.
+  heal_max_streak: "2"
+  heal_backoff_minutes: "180"
+  # Home Assistant unreachable this long -> the Reserve strategy assumes the worst
+  # outage and holds reserve_hours_worst_case (it cannot see the schedule or the
+  # emergency flag any more).
+  ha_absent_worst_case_minutes: "60"
+  reserve_hours_worst_case: "10"
+  # Optional daily restart, toggled by the "Nightly Restart" switch. Skipped if a charge
+  # session is running or the ESP restarted less than 6 h ago.
+  nightly_restart_hour: "3"
+
+  # Guard rails for the computed reserve, so an odd load reading can't push the
+  # target to either extreme.
+  # Floor was 35 when the usable range started at 25%. With the range now reaching
+  # down to 15 that clamp would inflate the reserve on light-load days for no reason.
+  reserve_soc_min: "25.0"
+  # Ceiling 70, not 85. At 85 a heater-on morning (900 W x 6 h) put the reserve at 77%,
+  # SoC 59% fell under the hold band, and the pack was rebuilt off the grid at the day
+  # rate from 07:00 to 10:20 while 0.4-1.6 kW of sun was available. 70% still holds
+  # ~5.5 kWh above the floor — six hours at 800 W — without turning the system back
+  # into a UPS on every cold day.
+  reserve_soc_max: "70.0"
+
+  # Night charging aims a little above the reserve to cover the morning before sun.
+  reserve_night_margin: "5.0"
+  reserve_restart_hysteresis: "5.0"
+  # From this hour to the end of the night window the restart threshold is the smaller
+  # hysteresis below: the pack used to reach 87-90% by 03:00 and slide to 81-85% by 07:00
+  # (18-31 Oct) without a restart, so every day began ~5 points under its target.
+  morning_topup_hour: "5"
+  reserve_restart_hysteresis_morning: "2.0"
+  # A post-outage top-up starts only this far below the reserve. Without it, grid return
+  # with the pack at 41% against a 42% reserve started a full charge session — mode
+  # switches and inverter EEPROM writes for 1% (three times in 18-25 Oct).
+  post_outage_min_deficit: "5.0"
+  # Hard ceiling for any automatic grid charge. Keeps LiFePO4 off its top plateau.
+  # 90, not 95. A 95% target put the cut-off at 57.4-57.6 V, the BMS read that as full
+  # and jumped its SoC to 100%, so in practice "95%" meant a full charge every night the
+  # forecast bump maxed out (overcharge protection fired five times in 2-10 Oct).
+  night_target_soc_max: "90.0"
+  # Manual Charge aims at a full pack: it is switched on by hand ahead of an outage,
+  # and the pack starts draining soon after. Idle PV fills to the same 57.6 V anyway.
+  manual_target_soc: "100.0"
+  # Soft-hold band below the reserve: grid carries the load, PV rebuilds the battery,
+  # but no grid charging yet.
+  reserve_hold_band: "10.0"
+
+  # Entering/leaving the hold band flips the inverter between SBU and SUB, which on MUST
+  # units means a transfer relay. SoC sitting right on the threshold must not make it
+  # chatter: leave the band only this far above the reserve, and never switch modes more
+  # often than the dwell time.
+  reserve_mode_deadband: "2.0"
+  mode_switch_dwell_minutes: "10"
+
+  # Bottom of the usable range, and the trigger for a forced emergency charge.
+  #
+  # Must stay AT OR ABOVE the SoC where the inverter itself quits, because the reserve
+  # is energy counted above this line — set it lower than reality and every autonomy
+  # figure becomes fiction. Paired with Battery stop discharging voltage (reg 20118):
+  #
+  #     20118 = 52.0 V  ->  this must be ~28   (the shipped setting, wasted a third
+  #                                             of the pack)
+  #     20118 = 49.0 V  ->  this can be ~15    (3.06 V/cell, roughly 8-12% on the
+  #                                             textbook curve; this pack reads high
+  #                                             per cell, so 15 keeps a margin)
+  #
+  # Lower the inverter register FIRST, then this. Ten days of history bottom out at
+  # 24% / 51.2 V, so anything below that is still unobserved territory — revisit once
+  # a deep discharge shows where it actually stops.
+  # Written to the inverter (reg 20118) on every boot, so this file owns BOTH ends of
+  # the usable range instead of one end living here and the other in Home Assistant.
+  # They drifted apart exactly that way: the register sat at 52.0 V — about 28% SoC on
+  # this pack — while the config assumed the battery was good down to 25%.
+  #
+  # 49.0 V = 3.06 V/cell, roughly 8-12% on the LiFePO4 curve. Keep it paired with
+  # critical_low_soc below, and keep both well above the BMS cut-off.
+  batt_stop_dischg_v: "49.0"
+
+  critical_low_soc: "15.0"
+  critical_high_soc: "99.0"
+  critical_safe_soc: "25.0"
+
+  # There is deliberately NO "the sun won't make it, start charging early" rule here.
+  # It needed a weather forecast and an opinion about tariffs, and it earned neither:
+  #   * on a grey day the hold band already stops the drain, and the night window
+  #     refills the pack a few hours later on the cheap tariff;
+  #   * when an outage really is coming, the HA outage automation raises Reserve
+  #     Autonomy Target, the reserve rises, SoC lands under the hold band and the
+  #     ordinary emergency path charges immediately — no forecast involved.
+  # It also fired every single evening after sunset (remaining PV is 0 by definition),
+  # buying an hour of grid at the day rate right before the night rate began.
+  # Policy about when it is cheap to charge lives in Home Assistant; the device keeps
+  # only the night window, the emergency floor and the post-outage top-up.
+
+  # A live house never draws less than this. Anything below it is a bad reading, not a
+  # quiet moment — the load average, the hourly profile and the autonomy estimate all
+  # ignore such samples and hold their last good value instead of decaying toward zero.
+  min_valid_load_w: "15"
+
+  # ============ GRID PRESENCE ============
+  # Below this the inverter is running off battery — treated as an outage.
+  grid_present_min_voltage: "150.0"
+
+  # ============ CHARGE CURRENTS (A) ============
+  charge_amps_start: "5.0"
+  charge_amps_step: "5.0"
+  charge_amps_min: "10.0"
+  charge_amps_max: "40.0"
+  charge_amps_default: "20.0"
+  charge_amps_critical: "40.0"
+  charge_amps_idle: "10.0"
+  # Unhurried grid top-up used when the reserve has to be rebuilt without sun.
+  charge_amps_slow: "15.0"
+
+  # ============ GRID VOLTAGE SAG PROTECTION ============
+  # Held for the whole charge session: below min the grid current steps down by
+  # charge_amps_step each cycle, at or above resume it steps back up to the target, at most
+  # one step per charge_ramp_step_s.
+  # 207/215, not 200/205: the house's voltage relay cuts the grid at ~190 V on dips shorter
+  # than our 30 s poll. 30 Oct-3 Nov every unscheduled grid loss came mid-charge (10-40 A),
+  # with the last polled reading only at 196-206 V.
+  grid_voltage_min: "207.0"
+  grid_voltage_resume: "215.0"
+  charge_ramp_step_s: "60"
+  # Grid lost mid-charge and back within this many minutes: most likely that relay, so the
+  # grid charge current is capped at (current at the loss - backoff) for relay_cap_minutes.
+  # Not the rest of the day: the line sags with the neighbours' load, which moves on.
+  relay_trip_return_minutes: "30"
+  relay_trip_backoff_amps: "10.0"
+  relay_cap_minutes: "30"
+  # Stage 0 of a grid return: the grid has to be back this long before the house goes on it
+  # (it stays on the battery meanwhile, while the battery can carry it) and before a grid
+  # charge starts or resumes; a session that was running is paused (charger priority OSO)
+  # and climbs again from charge_amps_start. On 8 Nov the returning line dropped out 3-5 min
+  # after each of four returns with only the house (~400 W) on it, so each loss within an
+  # hour of the previous one doubles this, up to grid_settle_max_minutes. A grid loss within
+  # relay_trip_window_s of a step up points at the relay: at least relay_trip_settle_minutes.
+  grid_settle_minutes: "2"
+  grid_settle_max_minutes: "10"
+  # After an outage of long_outage_hours or more, stage 0 lasts at least grid_settle_long_minutes:
+  # the whole line switches its boilers, fridges and chargers on at once. 29 Oct-8 Nov: after
+  # outages over 4 h the line dropped again 0.6-6.5 min after 6 of 9 returns; after shorter ones,
+  # 0 of 14. 3 h leaves a margin under the 4 h seen.
+  long_outage_hours: "3"
+  grid_settle_long_minutes: "10"
+  # ...and the voltage must have held at or above grid_stable_voltage for this long. On
+  # 3 Nov at 22:02 the returning line sagged 236 -> 210 V in two minutes on its own (every
+  # neighbour recharging at once), then tripped the relay at 5 A. 205, not the 215 V
+  # step-up threshold: a line sitting at 205-214 V all night still charges, held at the
+  # minimum by the sag regulation; 5 V above grid_charge_pause_voltage.
+  grid_stable_voltage: "205.0"
+  grid_stable_minutes: "3"
+  # A line that keeps dropping out is not stable after 3 min: on 4 Nov at 19:12-19:48 it went
+  # 5 times in 36 min, twice on its own and three times within a minute of our 5 A start. So
+  # every loss within an hour of the previous one doubles grid_stable_minutes, up to this.
+  # Not more: when power is given for an hour, a 24 min wait (plus the settle) left half of
+  # it unused.
+  grid_stable_max_minutes: "10"
+  # ...and the voltage must not be sliding: no more than grid_falling_volts below the highest
+  # reading of the last grid_falling_window_minutes. After a return the neighbours' load comes
+  # back over minutes (222 -> 205 V in 4 min that evening), and a line that passes 205 V on its
+  # way down trips anyway. 5 min, not 3: at 19:23 the last 3 min were already flat at 211-213 V,
+  # the slide from 222 V was before that.
+  grid_falling_volts: "4.0"
+  grid_falling_window_minutes: "5"
+  # Below grid_charge_pause_voltage a grid charge stops at once (it is the big step of load).
+  # Below weak_grid_voltage the house itself goes on the battery (SBU), while SoC is
+  # weak_grid_soc_margin above critical_low_soc: the house alone is a steady load, and a line
+  # holding 195-200 V can carry it without the charge; under 195 V it is heading for the
+  # relay's 190 V cut-off.
+  grid_charge_pause_voltage: "200.0"
+  weak_grid_voltage: "195.0"
+  weak_grid_soc_margin: "10.0"
+  # At least this long on the battery once weak: taking the house off the line lifts its
+  # voltage, and handing it straight back would swing the transfer relay every few minutes.
+  # Doubles (up to weak_grid_max_minutes) when the line goes weak again within an hour; the
+  # cap is short for the same reason as grid_stable_max_minutes (an hour of power at a time).
+  weak_grid_min_minutes: "10"
+  weak_grid_max_minutes: "20"
+  # The house goes back on the grid once the voltage has held this far above
+  # weak_grid_voltage for grid_stable_minutes (a separate, lower test than the 205 V charge
+  # gate: a line sitting just above weak_grid_voltage must not leave the house on the
+  # battery all night).
+  weak_grid_clear_margin: "3.0"
+  relay_trip_settle_minutes: "5"
+  relay_trip_window_s: "180"
+
+  # ============ TIME PARAMETERS (23:00-07:00) ============
+  night_start_hour: "23"
+  night_end_hour: "7"
+  morning_stop_hour: "7"
+  morning_stop_minute: "2"
+
+  # ============ BATTERY PARAMETERS ============
+  # battery_cells_s: number of LiFePO4 cells in series
+  #   8S  = ~24V (min 22.4V, max 29.2V, nominal 25.6V)
+  #   16S = ~48V (min 44.8V, max 58.4V, nominal 51.2V)  <- default
+  #   24S = ~72V (min 67.2V, max 87.6V, nominal 76.8V)
+  # All voltages are calculated automatically from this parameter.
+  # WARNING: LiFePO4 only. AGM/Li-Ion/NMC require a different curve.
+  battery_cells_s: "16"
+  # Inverter conversion efficiency and its standing self-consumption, measured directly
+  # on this unit rather than assumed.
+  #
+  # EFFICIENCY — grid off, no sun, a purely resistive 1.4 kW kettle switched in:
+  #     dAC 1438 W (resistive, so VA = W) / dDC 1655 W  ->  0.87
+  #   Taking the difference is essential: it cancels the unknown power factor of the
+  #   house's baseline load AND the offset in the inverter's battery-current register,
+  #   which reads 0 A while the pack is demonstrably supplying over 100 W. Absolute
+  #   readings from reg 25273/25274 are not usable; differences are.
+  #
+  # IDLE — from 11 long battery-only runs, which avoid the DC registers entirely:
+  #     17510 Wh left the pack (BMS SoC) to deliver 14300 Wh (inverter's own counter).
+  #     Conversion at 0.87 accounts for 16437 Wh; the remaining 1073 Wh over 39.8 h
+  #     is 27 W of standing draw.
+  #
+  # Earlier revisions of this file said 0.95 with no idle term (too optimistic) and
+  # then 0.817 with 69 W (too pessimistic, from an integration that missed samples and
+  # from treating inverter_power as real watts when it reports apparent power).
+  inverter_efficiency: "0.87"
+  inverter_idle_w: "27"

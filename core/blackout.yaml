@@ -1,0 +1,9 @@
+# Core aggregator. Include order matters for restored-item creation order; do not
+# reorder without re-running tools/prefs_layout.py.
+packages:
+  defaults: !include defaults.yaml   # substitutions only, no entities
+  settings: !include settings.yaml
+  state: !include state.yaml
+  control: !include control.yaml
+  heal: !include heal.yaml
+  sensors: !include sensors.yaml

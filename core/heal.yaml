@@ -1,0 +1,186 @@
+# Self-heal interval (verbatim from monolith).
+interval:
+  - interval: 30s
+    then:
+      - lambda: |-
+          static uint32_t api_bad_since = 0, wifi_bad_since = 0, ha_lost_since = 0;
+          const uint32_t now = millis();
+
+          auto restart = [&](uint8_t reason, const char *why) {
+            ESP_LOGE("heal", "🔁 Self-restart: %s", why);
+            id(self_restart_reason) = reason;
+            if (reason == 1 || reason == 2) id(heal_streak)++;
+            App.safe_reboot();  // syncs preferences first, so the reason survives
+          };
+
+          const bool wifi_ok = wifi::global_wifi_component->is_connected();
+          const bool api_ok = api::global_api_server->is_connected();
+
+          // Keep the wall clock in RTC memory so a restart without HA or internet does
+          // not lose it (see blackout::rtc_clock_save).
+          {
+            auto t = id(homeassistant_time).now();
+            if (t.is_valid()) blackout::rtc_clock_save((uint32_t) t.timestamp);
+          }
+
+          // Connection back: the restarts, if any, are no longer a streak.
+          if (wifi_ok && api_ok && id(heal_streak) != 0) id(heal_streak) = 0;
+
+          // Home Assistant out of reach -> Reserve assumes the worst outage.
+          if (api_ok) {
+            ha_lost_since = 0;
+            if (id(ha_absent_worst))
+              ESP_LOGI("heal", "🏠 Home Assistant back — reserve from the schedule again");
+            id(ha_absent_worst) = false;
+          } else {
+            if (ha_lost_since == 0) ha_lost_since = now == 0 ? 1 : now;
+            bool worst = now - ha_lost_since > ${ha_absent_worst_case_minutes} * 60000UL;
+            if (worst && !id(ha_absent_worst))
+              ESP_LOGW("heal", "🏠 No Home Assistant for ${ha_absent_worst_case_minutes} min — assuming the worst outage");
+            id(ha_absent_worst) = worst;
+          }
+
+          // Restarting did not help twice in a row -> only every few hours from now on.
+          const bool backoff = id(heal_streak) >= ${heal_max_streak};
+          const uint32_t backoff_ms = ${heal_backoff_minutes} * 60000UL;
+
+          // WiFi up but Home Assistant gone: either HA is down (a restart takes minutes,
+          // so the timeout sits well past that) or our API/TCP stack is wedged — the
+          // "ping answers, ports dead" state seen on 22 Sep. Only a restart clears that.
+          if (wifi_ok && !api_ok) {
+            if (api_bad_since == 0) api_bad_since = now;
+            uint32_t limit = backoff ? backoff_ms : ${heal_api_dead_minutes} * 60000UL;
+            if (now - api_bad_since > limit) restart(1, "WiFi up, API down too long");
+          } else {
+            api_bad_since = 0;
+          }
+
+          // WiFi down. A long outage of WiFi is most likely our own stack: the router has
+          // power with the grid up, and is on backup power during a blackout (see
+          // heal_wifi_dead_outage_minutes). The control loop keeps running without WiFi;
+          // the restart only brings the device back into view.
+          if (!wifi_ok) {
+            if (wifi_bad_since == 0) wifi_bad_since = now;
+            uint32_t limit = id(grid_present) ? ${heal_wifi_dead_minutes} * 60000UL
+                                              : ${heal_wifi_dead_outage_minutes} * 60000UL;
+            if (backoff && limit < backoff_ms) limit = backoff_ms;
+            if (now - wifi_bad_since > limit) restart(2, "WiFi down too long");
+          } else {
+            wifi_bad_since = 0;
+          }
+
+          // Inverter silent. The control loop already pauses on stale data; this is the
+          // step after that, for a software serial that stopped receiving.
+          // Backs off like the others: a dead RS485 adapter used to mean a restart every
+          // 20 min, 72 a day.
+          uint32_t last = id(last_soc_update_ms);
+          if (last != 0 && now - last < 60000UL && id(modbus_heal_streak) != 0) {
+            id(modbus_heal_streak) = 0;
+            if (id(rtc_state_loaded)) blackout::rtc_state_save(id(reserve_hours_set_epoch), id(session_night), id(modbus_heal_streak));
+          }
+          const uint32_t modbus_limit = id(modbus_heal_streak) >= ${heal_max_streak}
+              ? backoff_ms : ${heal_modbus_dead_minutes} * 60000UL;
+          if ((last != 0 && now - last > modbus_limit) || (last == 0 && now > modbus_limit)) {
+            id(modbus_heal_streak)++;
+            if (id(rtc_state_loaded)) blackout::rtc_state_save(id(reserve_hours_set_epoch), id(session_night), id(modbus_heal_streak));
+            restart(3, "no Modbus data too long");
+          }
+
+          // Optional daily restart, to clear whatever slowly accumulates (heap
+          // fragmentation above all — it climbed to 48% here). Needs a real clock, skips
+          // a running charge session, and the uptime check makes it once a night.
+          if (id(nightly_restart_enabled) && now > 6UL * 3600000UL &&
+              !id(charge_active) && !id(manual_charge_active) && !id(full_manual_mode)) {
+            auto t = id(homeassistant_time).now();
+            if (t.is_valid() && t.hour == ${nightly_restart_hour})
+              restart(4, "nightly");
+          }
+
+esphome:
+  on_boot:
+    # Web UI & Fallback AP switch. Runs after globals are restored (800) and before the
+    # captive portal (251) and web server (249) set themselves up. A component marked
+    # failed before its setup never runs it, so the AsyncWebServer — the heap the switch
+    # exists to save — is never allocated. The portal only ever starts together with
+    # the AP, and ap_timeout 0 means the AP never starts.
+    - priority: 600
+      then:
+        - lambda: |-
+            // Restore the wall clock saved before the restart (RTC memory survives soft
+            // restarts and watchdog resets, not a power cut). HA or SNTP overwrite it
+            // with the real time as soon as either is reachable.
+            {
+              uint32_t e = blackout::rtc_clock_load();
+              if (e != 0) {
+                struct timeval tv{(time_t) (e + 2), 0};  // ~2 s for the restart itself
+                settimeofday(&tv, nullptr);
+                ESP_LOGW("boot", "⏰ Clock restored from RTC memory");
+              }
+            }
+            // RtcState: values that survive a soft restart without a flash slot.
+            {
+              uint32_t epoch = 0; bool night = false; uint8_t streak = 0;
+              if (blackout::rtc_state_load(epoch, night, streak)) {
+                id(reserve_hours_set_epoch) = epoch;
+                id(session_night) = night;
+                id(modbus_heal_streak) = streak;
+              } else if (id(charge_active)) {
+                // After a power cut: a session restored from flash is taken for a night one,
+                // so the morning stop still ends it rather than letting it run into the day.
+                id(session_night) = true;
+              }
+              id(rtc_state_loaded) = true;
+            }
+            if (!id(web_ui_enabled)) {
+              id(web_srv).mark_failed();
+              id(captive).mark_failed();
+              wifi::global_wifi_component->set_ap_timeout(0);
+              ESP_LOGW("boot", "🌐 Web UI & fallback AP disabled by switch");
+            }
+
+    - priority: -100
+      then:
+        - lambda: |-
+            if (id(charge_active)) {
+              id(ramp_up_active) = true;
+              id(active_charge_amps) = ${charge_amps_start};
+              id(cmd_charge_amps) = ${charge_amps_start};
+              id(bi_charge_limit).execute(${charge_amps_start});
+              // Staged start after a restart too: the house on the grid, no charge until the
+              // line has held (the ramp resumes it), not the pre-restart grid charge at full speed.
+              id(charge_paused) = true;
+              id(session_start_ms) = millis();
+              id(bi_grid_permit).execute(false, true);
+              ESP_LOGI("boot", "♻️ Ramp restarted: charge_active was true before boot");
+            }
+            ESP_LOGI("boot", "🔕 Notifications suppressed for 5 min after boot");
+        - delay: 5min
+        - lambda: |-
+            id(boot_notifications_suppressed) = false;
+            ESP_LOGI("boot", "🔔 Notifications enabled after boot delay");
+            // Sync the charge stop with the inverter after reboot.
+            // active_stop_voltage is restored from flash and already reflects the
+            // forecast-driven target of the charge session that was active before boot.
+            if (id(charge_active)) {
+              float v = blackout::clamp_pack_voltage(id(active_stop_voltage), ${battery_cells_s});
+              id(active_stop_voltage) = v;
+              // The session's target SoC, not one derived from the voltage: the adapter adds
+              // the charge buffer itself, and adding it twice put a 65% stop at 54.48 V.
+              float stop_soc = id(active_target_soc);
+              id(cmd_stop_soc) = stop_soc;
+              id(bi_charge_stop).execute(stop_soc);
+              ESP_LOGI("boot", "🔋 charge stop restored: %.1fV", v);
+            }
+
+            // Own the discharge cut-off too. Leaving it to be set by hand is how it ended
+            // up at 52.0 V while the reserve maths assumed 25% SoC was reachable.
+            {
+              float want = ${batt_stop_dischg_v};
+              float want_soc = blackout::voltage_to_soc(want, ${battery_cells_s});
+              if (fabsf(id(cmd_discharge_stop) - want_soc) > 0.5f) {
+                id(cmd_discharge_stop) = want_soc;
+                id(bi_discharge_stop).execute(want_soc);
+                ESP_LOGI("boot", "🔻 discharge stop -> %.1fV (%.0f%%)", want, want_soc);
+              }
+            }
+

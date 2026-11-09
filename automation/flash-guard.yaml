@@ -1,0 +1,95 @@
+# Home Assistant automation (paste into automations.yaml, or the UI's YAML editor).
+alias: ESP Flash Guard
+description: >-
+  Watches the ESP's flash-restored settings. While the ESP has been up 10+ min it keeps a
+  snapshot of them in input_text.esp_settings_snapshot (your own changes update it). Right
+  after an ESP restart it compares: if two or more came back different at once, the flash
+  sector holding them has most likely failed (a worn ESP8266 sector loses data silently and
+  the values fall back to their defaults), and a notification says so. One value changed on
+  purpose never trips it.
+triggers:
+  - trigger: time_pattern
+    minutes: /10
+    id: snapshot
+  - trigger: numeric_state
+    entity_id: sensor.blackout_inverter_esp_uptime
+    below: 300
+    id: restarted
+conditions: []
+variables:
+  entities:
+    - number.blackout_inverter_battery_capacity
+    - number.blackout_inverter_target_charge_current
+    - select.blackout_inverter_energy_strategy
+    - switch.blackout_inverter_manual_charge_auto_disable
+    - switch.blackout_inverter_automation_night_charge
+    - switch.blackout_inverter_automation_emergency_charge
+    - switch.blackout_inverter_automation_battery_protection
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: snapshot
+          - condition: numeric_state
+            entity_id: sensor.blackout_inverter_esp_uptime
+            above: 600
+          - condition: template
+            value_template: "{{ entities | map('states') | select('in', ['unknown', 'unavailable']) | list | count == 0 }}"
+        sequence:
+          - variables:
+              now_snapshot: "{{ entities | map('states') | join('|') }}"
+          - if:
+              - condition: template
+                value_template: "{{ states('input_text.esp_settings_snapshot') != now_snapshot }}"
+            then:
+              - action: input_text.set_value
+                target:
+                  entity_id: input_text.esp_settings_snapshot
+                data:
+                  value: "{{ now_snapshot }}"
+      - conditions:
+          - condition: trigger
+            id: restarted
+        sequence:
+          # Give the ESP time to connect and publish every restored value.
+          - wait_template: >-
+              {{ entities | map('states') | select('in', ['unknown', 'unavailable']) | list | count == 0 }}
+            timeout: "00:05:00"
+            continue_on_timeout: false
+          - delay: "00:00:30"
+          - variables:
+              before: "{{ states('input_text.esp_settings_snapshot').split('|') }}"
+              after: "{{ entities | map('states') | list }}"
+              changed: >-
+                {% set ns = namespace(l=[]) %}
+                {% if before | count == entities | count %}
+                  {% for i in range(entities | count) %}
+                    {% if before[i] != after[i] %}
+                      {% set ns.l = ns.l + [entities[i] ~ ': ' ~ before[i] ~ ' → ' ~ after[i]] %}
+                    {% endif %}
+                  {% endfor %}
+                {% endif %}
+                {{ ns.l }}
+          - if:
+              - condition: template
+                value_template: "{{ changed | count >= 2 }}"
+            then:
+              - action: notify.notify
+                data:
+                  title: "⚠️ ESP flash: settings lost after restart"
+                  message: >-
+                    {{ changed | count }} settings came back different after the ESP
+                    restarted — most likely the flash sector holding them is failing.
+                    Check and re-enter them: {{ changed | join('; ') }}
+              - action: persistent_notification.create
+                data:
+                  title: ESP flash guard
+                  notification_id: esp_flash_guard
+                  message: >-
+                    After the ESP restart at {{ now().strftime('%H:%M') }} these settings
+                    differ from the last snapshot: {{ changed | join('; ') }}. A worn ESP8266
+                    flash sector loses data silently; if this repeats, replace the D1 mini
+                    and flash the same config.
+mode: queued
+max: 3
+max_exceeded: silent

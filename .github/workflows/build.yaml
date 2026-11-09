@@ -1,0 +1,53 @@
+name: Build
+
+# Every push and PR: contract checks, every example validated, host unit tests of the
+# C++ helpers, the flash layout against its baseline, and a full compile of the
+# reference device (examples/must-pv18.yaml). Manual dispatch compiles every example.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      compile_all:
+        description: 'Compile every example, not only must-pv18'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install ESPHome
+        run: pip install esphome==2026.10.0
+      - name: Host unit tests (components/blackout/blackout_helpers.h)
+        run: python tools/helpers_test.py
+      - name: Contract checks + validate every example
+        run: python tools/esphome_check.py all
+      - name: Flash layout unchanged (restored settings survive a flash)
+        run: python tools/prefs_layout.py --config examples/must-pv18.yaml --check tools/prefs_layout.expected.txt
+      - name: Compile the reference device
+        run: python tools/esphome_check.py compile --config examples/must-pv18.yaml
+
+  compile-all:
+    runs-on: ubuntu-latest
+    needs: check
+    if: github.event_name == 'workflow_dispatch' && inputs.compile_all
+    strategy:
+      matrix:
+        config: [examples/growatt-spf.yaml, examples/powmr-spf.yaml, examples/srne.yaml]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install ESPHome
+        run: pip install esphome==2026.10.0
+      - name: Compile ${{ matrix.config }}
+        run: python tools/esphome_check.py compile --config "${{ matrix.config }}"

@@ -1,0 +1,823 @@
+# Growatt SPF adapter - REAL Growatt Off-Grid V0.26 register map (UNTESTED live unit)
+# UART, Modbus controller, and all Modbus entities.
+#
+# UNTESTED: Register map from public docs (see Sources below); UNTESTED live unit -
+# verify every register against the device manual and live readings before flashing.
+# Grid charging is functional here (registers documented, not assumed), but the
+# header warning stands until live readings are checked because firmware variants differ.
+#
+# Sources:
+#   [1] Growatt OffGrid Modbus RS485/RS232 RTU Protocol V0.26
+#       (OffGrid-Modbus-RS485-RS232-RTU-Protocol-V0-26.xlsx / GrowattModBusProtocol.pdf)
+#       https://www.watts247.com/manuals/gw/GrowattModBusProtocol.pdf (V0.11, original SPF5000)
+#   [2] 0xAHA Growatt_ModbusTCP - Off-Grid V0.26 register reference (extracted from V0.26 xlsx)
+#       https://0xaha.github.io/Growatt_ModbusTCP/developer/protocol-offgrid/
+#       https://0xaha.github.io/Growatt_ModbusTCP/controls/entity-reference/#spf-off-grid-inverters
+#   [3] vipmenable Growatt SPF modbus.yaml input-register layout (addresses 0-37, RS485 9600 8N1)
+#       (input area verified against [2]; RS485 timing 9600 bps, ~850 ms min CMD period)
+#
+# Register table (holding = function 0x03 writes, input = function 0x04 reads):
+#   Holding 1   Output Priority   SBU=0 SOL=1 UTI=2 SUB=3  [1][2]
+#   Holding 2   Charge Priority   CSO=0 SNU=1 OSO=2        [1][2]
+#   Holding 34  MaxChargeCurr (total solar+AC) 10-130 A, 1 A step [1][2]
+#   Holding 35  BulkChargeVolt x0.1 V (500-580 -> 50.0-58.0 V) [1][2]
+#   Holding 36  FloatChargeVolt x0.1 V (500-560 -> 50.0-56.0 V) [1][2]
+#   Holding 37  BatLowToUtiVolt x0.1 V [1][2]
+#   Holding 38  ACChargeCurr (from grid) 0-80 A, x0.1 A [2] (=FloatChargeCurr in V0.11 [1])
+#   Holding 82  wBatLowCutOff x0.1 V [2]
+#   Holding 95  uwAC2BatVolt x0.1 V (AC to battery switchover) [2]
+#   Holding 116 uwLoadFirst BLU=0 LBU=1 (fw >= 100.08/101.07) [2]
+#   Input 0     System Status [1][2]
+#   Input 1     Vpv1 x0.1 V
+#   Input 2     Vpv2 x0.1 V
+#   Input 3     Ppv1 H/L uint32 x0.1 W
+#   Input 5     Ppv2 H/L uint32 x0.1 W
+#   Input 7     Buck1Curr/Pv1Curr x0.1 A
+#   Input 8     Buck2Curr/Pv2Curr x0.1 A
+#   Input 9     OP_Watt H/L uint32 x0.1 W (inverter output active power)
+#   Input 17    BatVolt x0.01 V
+#   Input 18    BatterySOC %
+#   Input 19    BusVolt x0.1 V
+#   Input 20    GridVolt x0.1 V
+#   Input 21    LineFreq x0.01 Hz
+#   Input 22    OutputVolt x0.1 V
+#   Input 23    OutputFreq x0.01 Hz
+#   Input 25    InvTemp x0.1 C
+#   Input 26    DcDcTemp x0.1 C
+#   Input 27    LoadPercent x0.1 %
+#   Input 36    AC_InWatt H/L int32 x0.1 W (>0 import, <0 export)
+#   Input 40    Fault bit [2]
+#   Input 41    Warning bit
+#   Input 42    Warning bit high
+#   Input 50    Epv1_total H/L uint32 x0.1 kWh
+#   Input 54    Epv2_total H/L uint32 x0.1 kWh
+#   Input 58    Eac_chrTotal H/L uint32 x0.1 kWh
+#   Input 62    Ebat_dischrTotal H/L uint32 x0.1 kWh
+#   Input 66    Eac_dischrTotal H/L uint32 x0.1 kWh
+#   Input 68    ACChrCurr x0.1 A
+#   Input 77    Bat_Watt H/L int32 x0.1 W (positive=discharge, negative=charge)
+#   Input 87    Eop_dischrTotal H/L uint32 x0.1 kWh
+#   Input 100   EBatChgTotal H/L uint32 x0.1 kWh
+#   Input 104   CtLoadWatt H/L uint32 x0.1 W (CT load; load_power_sensor floor)
+#
+# Sign conventions adapted to core (both must read the same as MUST):
+#   grid_power_sensor is NEGATIVE while importing (Growatt AC_InWatt is positive import,
+#     so the filter is multiply: -0.1)
+#   battery_power / battery_current: charging is positive (Growatt Bat_Watt is positive
+#     discharge, so battery_current template negates Bat_Watt / Bat_Volt)
+#
+# Max Charge Current (34) is the total solar+AC cap: if it sits below the AC limit (38),
+# it caps the utility charger too. bi_grid_charge writes only the AC limit (38); keep 34 >= target.
+# Bulk (35) and Float (36) are only writable when Battery Type is self-defined; they are exposed
+# as config entities but bi_charge_stop writes bulk (batt_stop_chg aliases the same register as
+# the absorb register — there is no separate Voltronic-style stop register on Growatt).
+# BLU/LBU (116) is firmware-dependent (100.08+/101.07+); bi_solar_priority writes it if present.
+
+# The contract surface (bi_* scripts, reconcile, read-back sensors) is shared by the
+# Voltronic-family adapters; this file only declares the entities it drives.
+packages:
+  sync: !include
+    file: common/voltronic-sync.yaml
+    vars:
+      adapter_name: "Growatt SPF"
+      cap_solar_aim: "1"
+      cap_grid_only: "0"
+      stop_by_soc: "0"
+      writes_enabled: "0"   # UNTESTED: no inverter writes until the readings are checked
+
+uart:
+  id: mod_bus
+  tx_pin: ${tx_pin}
+  rx_pin: ${rx_pin}
+  baud_rate: 9600
+  stop_bits: 1
+  parity: NONE
+  data_bits: 8
+
+
+modbus:
+  id: mod_bus_growatt
+  send_wait_time: 850ms
+  flow_control_pin: ${flow_control_pin}
+
+
+modbus_controller:
+  - id: growatt
+    address: 0x1
+    modbus_id: mod_bus_growatt
+    setup_priority: -10
+    update_interval: ${updates}
+
+
+number:
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    id: grid_charger_amps
+    name: "Max Grid Charger current"
+    unit_of_measurement: "A"
+    address: 38
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+    entity_category: config
+
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    id: batt_float_voltage
+    name: "Float voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 36
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    id: batt_absorb_voltage
+    name: "Absorb voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 35
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    id: max_charge_amps
+    name: "Max Charge Current (total)"
+    unit_of_measurement: "A"
+    entity_category: config
+    address: 34
+    value_type: U_WORD
+    lambda: "return x;"
+    write_lambda: "return x;"
+
+  # ============ BMS PROTECTION PARAMETERS ============
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    id: batt_stop_dischg
+    name: "Battery stop discharging voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 37
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    id: batt_stop_chg
+    name: "Battery stop charging voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 35
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    id: batt_low_voltage
+    name: "Battery low voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 82
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    id: batt_high_voltage
+    name: "Battery high voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 95
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+
+
+
+select:
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    id: energy_use_mode
+    name: "Energy use mode (parameter 00)"
+    address: 1
+    entity_category: config
+    optionsmap:
+      "SBU (Solar/battery/utility)": 0
+      "SOL (Solar only)": 1
+      "UTI (Utility only)": 2
+      "SUB (Solar/utility/battery)": 3
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    id: charger_source_priority
+    name: "Charger source priority (parameter 10)"
+    address: 2
+    entity_category: config
+    optionsmap:
+      "CSO (Solar first)": 0
+      "SNU (Solar and utility)": 1
+      "OSO (Solar only)": 2
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    id: solar_use_aim
+    name: "Solar Use Aim"
+    address: 116
+    entity_category: config
+    optionsmap:
+      "BLU (Battery, Load, Utility)": 0
+      "LBU (Load, Battery, Utility)": 1
+
+  # ============ ENERGY STRATEGY ============
+  # Mirrors the MUST strategy comments; the derivation (Sun/Reserve/Backup) lives
+  # in core and is translated to SBU/SUB/UTI by bi_house below.
+
+text_sensor:
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 0
+    name: "System Status"
+    icon: mdi:battery-charging-50
+    register_type: input
+    raw_encode: HEXBYTES
+    lambda: |-
+      uint16_t value = modbus::helpers::word_from_hex_str(x, 0);
+      switch (value) {
+        case 0: return std::string("Standby");
+        case 2: return std::string("Battery Discharging");
+        case 3: return std::string("Fault");
+        case 5: return std::string("PV Charging");
+        case 6: return std::string("Grid Charging");
+        case 7: return std::string("PV&Grid Charging");
+        case 11: return std::string("Grid Bypass");
+        case 12: return std::string("PV Charging+Loads");
+        default: return std::string("Other (" + std::to_string(value) + ")");
+      }
+      return x;
+
+sensor:
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 18
+    id: battery_state_of_charge
+    name: "Battery State of Charge"
+    register_type: input
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+    value_type: U_WORD
+    on_value:
+      - lambda: 'id(last_soc_update_ms) = millis(); id(bi_data_ms) = millis();'
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 0
+    name: "Inverter Work State"
+    register_type: input
+    entity_category: diagnostic
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 40
+    name: "Fault bit"
+    register_type: input
+    entity_category: diagnostic
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 41
+    name: "Warning bit"
+    register_type: input
+    entity_category: diagnostic
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 42
+    name: "Warning bit high"
+    register_type: input
+    entity_category: diagnostic
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 1
+    name: "PV1 Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: input
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 2
+    name: "PV2 Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: input
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 7
+    name: "PV1 Current"
+    disabled_by_default: true
+    unit_of_measurement: "A"
+    device_class: current
+    register_type: input
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 8
+    name: "PV2 Current"
+    disabled_by_default: true
+    unit_of_measurement: "A"
+    device_class: current
+    register_type: input
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 3
+    id: pv1_power_sensor
+    name: "PV1 Power"
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: input
+    value_type: U_DWORD
+    accuracy_decimals: 0
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 5
+    id: pv2_power_sensor
+    name: "PV2 Power"
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: input
+    value_type: U_DWORD
+    accuracy_decimals: 0
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 17
+    id: battery_voltage_sensor
+    name: "Battery voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: input
+    accuracy_decimals: 2
+    state_class: measurement
+    filters:
+      - multiply: 0.01
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 19
+    name: "Bus voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: input
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 20
+    id: grid_voltage_sensor
+    name: "Grid voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: input
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 21
+    name: "Line frequency"
+    unit_of_measurement: "Hz"
+    device_class: frequency
+    register_type: input
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.01
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 22
+    name: "Output voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: input
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 23
+    name: "Output frequency"
+    unit_of_measurement: "Hz"
+    device_class: frequency
+    register_type: input
+    accuracy_decimals: 2
+    state_class: measurement
+    filters:
+      - multiply: 0.01
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 25
+    name: "Inverter temp"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    register_type: input
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 26
+    name: "DC-DC temp"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    register_type: input
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 27
+    name: "Load percent"
+    unit_of_measurement: "%"
+    register_type: input
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 9
+    id: inverter_power_sensor
+    name: "Inverter power"
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: input
+    value_type: U_DWORD
+    accuracy_decimals: 0
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 36
+    id: grid_power_sensor
+    name: "Grid power"
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: input
+    value_type: S_DWORD
+    accuracy_decimals: 0
+    state_class: measurement
+    filters:
+      - multiply: -0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 104
+    id: load_power_sensor
+    # CT load — covers bypass when inverter output reads zero.
+    name: "Load power"
+    disabled_by_default: true
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: input
+    value_type: U_DWORD
+    accuracy_decimals: 0
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 68
+    name: "AC charge current (actual)"
+    unit_of_measurement: "A"
+    device_class: current
+    register_type: input
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 77
+    id: battery_power
+    name: "Battery power"
+    # Bat_Watt: positive=discharge, negative=charge (growatt sign). Diagnostic only.
+    disabled_by_default: true
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: input
+    value_type: S_DWORD
+    accuracy_decimals: 0
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: template
+    id: battery_current
+    name: "Battery current"
+    # Derived so charging is positive (core convention), no BMS dependency.
+    disabled_by_default: true
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 1
+    lambda: |-
+      float p = id(battery_power).state;
+      float v = id(battery_voltage_sensor).state;
+      if (isnan(p) || isnan(v) || v <= 0.0f) return NAN;
+      return -p / v;
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 50
+    id: pv1_energy_total
+    name: "PV1 Energy Total"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    register_type: input
+    value_type: U_DWORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 54
+    id: pv2_energy_total
+    name: "PV2 Energy Total"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    register_type: input
+    value_type: U_DWORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 58
+    id: ac_charge_energy_total
+    name: "AC Charge Energy Total"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    register_type: input
+    value_type: U_DWORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 62
+    id: bat_discharge_energy_total
+    name: "Battery Discharge Energy Total"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    register_type: input
+    value_type: U_DWORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 66
+    id: ac_discharge_energy_total
+    name: "AC Discharge Energy Total"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    register_type: input
+    value_type: U_DWORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 100
+    id: bat_charge_energy_total
+    name: "Battery Charge Energy Total"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    register_type: input
+    value_type: U_DWORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: growatt
+    address: 87
+    id: output_discharge_energy_total
+    name: "Output Discharge Energy Total"
+    unit_of_measurement: "kWh"
+    device_class: energy
+    state_class: total_increasing
+    register_type: input
+    value_type: U_DWORD
+    accuracy_decimals: 1
+    filters:
+      - multiply: 0.1
+
+  # Contract readings (bi_*). Fixed ids for the core; each mirrors one Growatt
+  # entity (or a trivial derived quantity) and holds NAN while unavailable.
+  - platform: template
+    id: bi_soc
+    internal: true
+    name: "BI SoC"
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(battery_state_of_charge).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_battery_voltage
+    internal: true
+    name: "BI Battery voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 2
+    lambda: |-
+      float v = id(battery_voltage_sensor).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_battery_power
+    internal: true
+    name: "BI Battery power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(battery_power).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_grid_voltage
+    internal: true
+    name: "BI Grid voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 1
+    lambda: |-
+      float v = id(grid_voltage_sensor).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_load_power
+    internal: true
+    name: "BI Load power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(load_power_sensor).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_pv_power
+    internal: true
+    name: "BI PV power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v1 = id(pv1_power_sensor).state;
+      float v2 = id(pv2_power_sensor).state;
+      if (isnan(v1) && isnan(v2)) return NAN;
+      if (isnan(v1)) v1 = 0.0f;
+      if (isnan(v2)) v2 = 0.0f;
+      return v1 + v2;
+
+  - platform: template
+    id: bi_grid_power
+    internal: true
+    name: "BI Grid power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float g = id(grid_power_sensor).state;
+      if (isnan(g)) return NAN;
+      return g < 0.0f ? -g : 0.0f;
+
+  - platform: template
+    id: bi_battery_current
+    internal: true
+    name: "BI Battery current"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 1
+    lambda: |-
+      float v = id(battery_current).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_grid_present
+    internal: true
+    name: "BI Grid present"
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(grid_voltage_sensor).state;
+      if (isnan(v)) return NAN;
+      return v > 150.0f ? 1.0f : 0.0f;
+
+  - platform: template
+    id: bi_charger_state
+    internal: true
+    name: "BI Charger state"
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float i = id(battery_current).state;
+      float v = id(battery_voltage_sensor).state;
+      float stop = id(batt_stop_chg).state;
+      if (isnan(i) || isnan(v)) return NAN;
+      if (!isnan(stop) && v >= stop - 0.2f && i < 2.0f) return 2.0f;
+      return i > 0.5f ? 1.0f : 0.0f;

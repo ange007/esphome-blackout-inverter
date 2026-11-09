@@ -1,0 +1,30 @@
+# Home Assistant automation (paste into automations.yaml, or the UI's YAML editor).
+alias: Outage Charge Plan
+description: >-
+  Sends sensor.outage_charge_plan to the ESP's number.blackout_inverter_outage_plan_soc every
+  30 min (the ESP drops a plan not refreshed for 12 h) and whenever the plan changes.
+  Design: docs/design/outage-charge-plan.md.
+triggers:
+  - trigger: state
+    entity_id: sensor.outage_charge_plan
+  - trigger: time_pattern
+    minutes: "/30"
+    seconds: 30
+  - trigger: homeassistant
+    event: start
+conditions:
+  # A number, and a fresh one: re-sending an old plan every 30 min would defeat the ESP's
+  # 12 h expiry, which is there for exactly the case where the plan stops being computed.
+  - condition: template
+    value_template: >-
+      {{ states('sensor.outage_charge_plan') | is_number
+         and (now() - states.sensor.outage_charge_plan.last_updated).total_seconds() < 4500 }}
+actions:
+  - action: number.set_value
+    target:
+      entity_id: number.blackout_inverter_outage_plan_soc
+    data:
+      value: "{{ [0, [states('sensor.outage_charge_plan') | float(0), 100] | min] | max | round(0) }}"
+mode: queued
+max: 3
+max_exceeded: silent

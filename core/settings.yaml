@@ -1,0 +1,684 @@
+# All restored items, in baseline creation order (switches, numbers, globals).
+# Baseline: tools/prefs_layout.py sha 2b59d20ab13f (33 items, 38 words). Append-only.
+
+switch:
+  - platform: restart
+    name: "Must Inverter Restart"
+    entity_category: diagnostic
+
+  - platform: template
+    name: "Manual Charge"
+    id: manual_charge_switch
+    icon: "mdi:hand-back-right"
+    entity_category: ""
+    optimistic: yes
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - globals.set:
+          id: manual_charge_active
+          value: 'true'
+      - globals.set:
+          id: charge_active
+          value: 'true'
+      # Current limit before the charger opens (see start_charge_with_target: the inverter leaves 80 A
+      # there after every outage). The adapter writes current first, then permission.
+      # Stage 1: house on the grid, charger off; the ramp adds the charge (stage 2).
+      # The adapter picks the day/night energy mode for a session on the grid.
+      - lambda: |-
+          id(cmd_charge_amps) = ${charge_amps_start};
+          id(bi_charge_limit).execute(${charge_amps_start});
+          id(bi_grid_permit).execute(false, true);
+          id(cmd_house) = 1;
+          id(bi_house).execute(1);
+          float target = id(manual_charge_amps_number).state;
+          if (!(target >= ${charge_amps_min} && target <= ${charge_amps_max})) {
+            target = ${charge_amps_default};
+          }
+          id(target_charge_amps) = target;
+          id(active_charge_amps) = ${charge_amps_start};
+          id(ramp_up_active) = true;
+          id(charge_paused) = true;  // stage 1, see the select above
+          id(last_step_ms) = millis();
+          id(session_start_ms) = millis();
+          id(session_night) = false;
+          if (id(rtc_state_loaded)) blackout::rtc_state_save(id(reserve_hours_set_epoch), id(session_night), id(modbus_heal_streak));
+          id(manual_off_pending) = false;
+
+          // A manual session fills the pack (cut-off 57.6 V, see blackout::CELL_V_MAX).
+          // With Manual Charge Auto-Disable on it ends there instead of floating on top.
+          float chg_stop_v = blackout::charge_stop_voltage(${manual_target_soc}, ${battery_cells_s});
+          id(active_target_soc) = ${manual_target_soc};
+          id(active_stop_voltage) = chg_stop_v;  // single source of truth for watchdog/boot
+          float stop_soc = ${manual_target_soc};
+          id(cmd_stop_soc) = stop_soc;
+          id(bi_charge_stop).execute(stop_soc);
+
+          ESP_LOGI("manual", "🔧 Manual: %.0fA, stop=%.1fV", target, chg_stop_v);
+          if (!id(bi_in_pass)) id(bi_sync).execute();  // else the pass syncs on exit
+    # ESPHome runs this at every boot too (TemplateSwitch::setup applies the restored
+    # state through control()), so it must act only on a manual session that is running:
+    # unguarded it ended whatever charge was in progress at each restart and rewrote four
+    # inverter registers.
+    turn_off_action:
+      - if:
+          condition:
+            lambda: 'return id(manual_charge_active);'
+          then:
+          - globals.set:
+              id: manual_charge_active
+              value: 'false'
+          - globals.set:
+              id: charge_active
+              value: 'false'
+          - globals.set:
+              id: ramp_up_active
+              value: 'false'
+          - globals.set:
+              id: charge_paused
+              value: 'false'
+          - globals.set:
+              id: manual_off_pending
+              value: 'false'
+          - lambda: |-
+              bool backup = (id(energy_strategy) == 2);
+              id(cmd_house) = backup ? 1 : 0;
+              id(bi_house).execute(backup ? 1 : 0);
+          - lambda: |-
+              // Idle current, under the relay-trip cap (Backup keeps charging at it).
+              float idle_amps = ${charge_amps_idle};
+              if (id(relay_cap_amps) > 0.0f && id(relay_cap_amps) < idle_amps) idle_amps = id(relay_cap_amps);
+              id(cmd_charge_amps) = idle_amps;
+              id(bi_charge_limit).execute(idle_amps);
+              // Open the cut-off back up (see blackout::CELL_V_MAX); Backup idles on grid
+              // charge, so there it stays at the backup target.
+              id(active_stop_voltage) = id(energy_strategy) == 2
+                  ? blackout::charge_stop_voltage(${backup_target_soc}, ${battery_cells_s})
+                  : blackout::max_stop_voltage(${battery_cells_s});
+              float stop_soc = id(energy_strategy) == 2 ? ${backup_target_soc} : 100.0f;
+              id(cmd_stop_soc) = stop_soc;
+              id(bi_charge_stop).execute(stop_soc);
+              // Charger off in every strategy: the idle block gives Backup its grid charge
+              // back once the grid has settled, rather than charging on a grid that has just returned.
+              id(bi_grid_permit).execute(false, false);
+              if (!id(bi_in_pass)) id(bi_sync).execute();  // else the pass syncs on exit
+          - logger.log: "Manual STOP"
+
+  # ============ AUTOMATION TOGGLES ============
+
+  - platform: template
+    name: "Automation: Night Charge"
+    id: night_charge_auto_switch
+    icon: "mdi:weather-night"
+    entity_category: ""
+    optimistic: yes
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - globals.set:
+          id: night_charge_automation_enabled
+          value: 'true'
+      - logger.log: "🌙 Night charge ON"
+    turn_off_action:
+      - globals.set:
+          id: night_charge_automation_enabled
+          value: 'false'
+      - logger.log: "🌙 Night charge OFF"
+
+
+  - platform: template
+    name: "Automation: Emergency Charge"
+    id: emergency_charge_auto_switch
+    icon: "mdi:alert-circle"
+    entity_category: ""
+    optimistic: yes
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - globals.set:
+          id: emergency_charge_automation_enabled
+          value: 'true'
+      - logger.log: "⚠️ Emergency charge ON"
+    turn_off_action:
+      - globals.set:
+          id: emergency_charge_automation_enabled
+          value: 'false'
+      - logger.log: "⚠️ Emergency charge OFF"
+
+
+  - platform: template
+    name: "Automation: Battery Protection"
+    id: battery_protection_switch
+    icon: "mdi:shield-alert"
+    entity_category: ""
+    optimistic: yes
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - globals.set:
+          id: battery_protection_enabled
+          value: 'true'
+      - logger.log: "⛔ Battery protection ON"
+    turn_off_action:
+      - globals.set:
+          id: battery_protection_enabled
+          value: 'false'
+      - logger.log: "⚠️ Battery protection OFF!"
+
+
+  - platform: template
+    # Named so it sorts next to "Manual Charge" — the two belong together.
+    name: "Manual Charge Auto-Disable"
+    id: auto_disable_manual_switch
+    icon: "mdi:auto-fix"
+    entity_category: ""
+    optimistic: yes
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - globals.set:
+          id: auto_disable_manual_charge
+          value: 'true'
+      - logger.log: "✅ Auto CAN override"
+    turn_off_action:
+      - globals.set:
+          id: auto_disable_manual_charge
+          value: 'false'
+      - logger.log: "🔒 Manual PRIORITY"
+
+  # Takes effect at boot only (see esphome.on_boot), so a change restarts the ESP.
+
+  - platform: template
+    name: "Full Manual Mode"
+    id: full_manual_mode_switch
+    icon: "mdi:lock-open-variant"
+    entity_category: ""
+    optimistic: yes
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - globals.set:
+          id: full_manual_mode
+          value: 'true'
+      # Hand the inverter over in a clean idle state, as the monolith did: mode, idle
+      # current, open cut-off, and the charger off (on for Backup). All before hands_off
+      # below, which makes the adapter forget these wishes and stop reconciling.
+      - lambda: |-
+          if (id(charge_active) && !id(manual_charge_active)) {
+            bool backup = (id(energy_strategy) == 2);
+            id(cmd_house) = backup ? 1 : 0;
+            id(bi_house).execute(backup ? 1 : 0);
+
+            float idle_amps = ${charge_amps_idle};
+            if (id(relay_cap_amps) > 0.0f && id(relay_cap_amps) < idle_amps) idle_amps = id(relay_cap_amps);
+            id(cmd_charge_amps) = idle_amps;
+            id(bi_charge_limit).execute(idle_amps);
+
+            id(charge_active) = false;
+            id(ramp_up_active) = false;
+            id(charge_paused) = false;
+            id(active_stop_voltage) = backup
+                ? blackout::charge_stop_voltage(${backup_target_soc}, ${battery_cells_s})
+                : blackout::max_stop_voltage(${battery_cells_s});
+            float stop_soc = backup ? ${backup_target_soc} : 100.0f;
+            id(cmd_stop_soc) = stop_soc;
+            id(bi_charge_stop).execute(stop_soc);
+            id(bi_grid_permit).execute(backup, false);
+            if (!id(bi_in_pass)) id(bi_sync).execute();  // else the pass syncs on exit
+          }
+      - globals.set:
+          id: hands_off
+          value: 'true'
+      - logger.log:
+          format: "🔒 FULL MANUAL MODE ON"
+          level: WARN
+    turn_off_action:
+      - globals.set:
+          id: full_manual_mode
+          value: 'false'
+      - globals.set:
+          id: hands_off
+          value: 'false'
+      - logger.log: "🔓 FULL MANUAL MODE OFF"
+
+
+  # Takes effect at boot only (see esphome.on_boot), so a change restarts the ESP.
+  - platform: template
+    name: "Web UI & Fallback AP"
+    icon: "mdi:web"
+    entity_category: config
+    # DISABLED: the state is the global's. The default (ALWAYS_OFF) ran turn_off_action
+    # at every boot, which disabled the web UI and rebooted.
+    restore_mode: DISABLED
+    lambda: 'return id(web_ui_enabled);'
+    turn_on_action:
+      - if:
+          condition:
+            lambda: 'return !id(web_ui_enabled);'
+          then:
+            - globals.set: { id: web_ui_enabled, value: 'true' }
+            - logger.log: "🌐 Web UI & fallback AP enabled — restarting to apply"
+            - delay: 2s
+            - lambda: 'App.safe_reboot();'
+    turn_off_action:
+      - if:
+          condition:
+            lambda: 'return id(web_ui_enabled);'
+          then:
+            - globals.set: { id: web_ui_enabled, value: 'false' }
+            - logger.log: "🌐 Web UI & fallback AP disabled — restarting to apply"
+            - delay: 2s
+            - lambda: 'App.safe_reboot();'
+
+  - platform: template
+    name: "Nightly Restart"
+    icon: "mdi:restart"
+    entity_category: config
+    restore_mode: DISABLED  # state is the global's; ALWAYS_OFF cleared it at every boot
+    lambda: 'return id(nightly_restart_enabled);'
+    turn_on_action:
+      - globals.set: { id: nightly_restart_enabled, value: 'true' }
+    turn_off_action:
+      - globals.set: { id: nightly_restart_enabled, value: 'false' }
+
+number:
+  - platform: template
+    name: "Target Charge Current"
+    id: manual_charge_amps_number
+    unit_of_measurement: "A"
+    device_class: current
+    icon: "mdi:lightning-bolt"
+    entity_category: ""
+    min_value: 10
+    max_value: 40
+    initial_value: 20
+    step: 5
+    optimistic: true
+    restore_value: true
+    mode: box
+    set_action:
+      - lambda: |-
+          float new_target = x;
+          if (id(charge_active)) {
+            float current = id(active_charge_amps);
+            if (new_target > current) {
+              id(target_charge_amps) = new_target;
+              id(ramp_up_active) = true;
+              ESP_LOGI("settings", "⬆️ %.0fA → %.0fA", current, new_target);
+            } else if (new_target < current) {
+              id(cmd_charge_amps) = new_target;
+              id(bi_charge_limit).execute(new_target);
+              if (!id(bi_in_pass)) id(bi_sync).execute();  // else the pass syncs on exit
+          
+              id(active_charge_amps) = new_target;
+              id(target_charge_amps) = new_target;
+              id(ramp_up_active) = false;
+              ESP_LOGI("settings", "⬇️ %.0fA → %.0fA", current, new_target);
+            }
+          } else {
+            id(target_charge_amps) = new_target;
+            ESP_LOGI("settings", "🎯 %.0fA", new_target);
+          }
+
+  # Hours of autonomy the reserve must cover. 0 = follow the Energy Strategy preset
+  # (Sun ${reserve_hours_sun}h / Reserve ${reserve_hours_reserve}h).
+  #
+  # Meant to be driven from Home Assistant when you know more than the ESP does — e.g.
+  # an outage-schedule calendar saying tonight's block is 8 hours long. Set it back to 0
+  # to hand control back to the strategy.
+
+  - platform: template
+    name: "Reserve Autonomy Target"
+    id: reserve_hours_number
+    unit_of_measurement: "h"
+    device_class: duration
+    icon: "mdi:timer-sand"
+    entity_category: ""
+    min_value: 0
+    max_value: 12
+    step: 0.5
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: box
+    set_action:
+      - lambda: |-
+          // Stamp the write so the device can tell a live override from an abandoned
+          // one; after ${reserve_override_ttl_hours}h with no update it reverts on its own.
+          id(reserve_hours_set_ms) = millis();
+          {
+            auto tn = id(homeassistant_time).now();
+            id(reserve_hours_set_epoch) = tn.is_valid() ? (uint32_t) tn.timestamp : 0;
+            if (id(rtc_state_loaded)) blackout::rtc_state_save(id(reserve_hours_set_epoch), id(session_night), id(modbus_heal_streak));
+          }
+          id(prefs_flush_pending) = !(fabsf(x - id(reserve_hours_number).state) < 0.01f);
+          if (x <= 0.0f) {
+            ESP_LOGI("reserve", "⏱️ Autonomy target → auto (strategy preset)");
+          } else {
+            ESP_LOGI("reserve", "⏱️ Autonomy target → %.1fh (override, valid %sh)",
+                     x, "${reserve_override_ttl_hours}");
+          }
+      # Flush to flash now rather than at the next 5-minute preferences sync. This ESP
+      # restarts several times a day, and a restart inside that window restored the old
+      # value: the 07:05 reset of the night bump came back as 19% at 07:08 on 11 Oct.
+      # Delayed because the number saves its own value only after this action returns;
+      # skipped for rewrites of the same value, which HA sends every half hour.
+      - delay: 1s
+      - lambda: |-
+          if (id(prefs_flush_pending)) {
+            id(prefs_flush_pending) = false;
+            global_preferences->sync();
+          }
+
+  # Extra SoC to charge tonight on top of the reserve, written by the Battery Smart
+  # Management automation from tomorrow's forecast: whatever the sun will not cover,
+  # bought at the night rate instead of the day rate.
+  #
+  # Replaced a four-step select (off/eco/balanced/max = 0/5/10/20%). HA already computed
+  # the exact shortfall and then rounded it into one of four buckets for the device to
+  # unpack again; worse, the top bucket capped at 20% while a winter shortfall is nearer
+  # 70% of the pack, so the ladder quietly under-bought exactly when it mattered.
+  #
+  # The real ceiling is night_target_soc_max minus the reserve, and the firmware already
+  # enforces it. Restored across reboots, with a 12 h expiry stamped on every write: the
+  # non-restored version lost the bump to the first reboot of the night, and this ESP
+  # reboots several times a night.
+
+  - platform: template
+    name: "Night Charge Bump"
+    id: night_charge_bump
+    unit_of_measurement: "%"
+    icon: "mdi:battery-clock"
+    entity_category: config
+    min_value: 0
+    max_value: 40
+    step: 1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: box
+    set_action:
+      - lambda: |-
+          auto t = id(homeassistant_time).now();
+          id(night_bump_set_epoch) = t.is_valid() ? (uint32_t) t.timestamp : 0;
+          id(prefs_flush_pending) = !(fabsf(x - id(night_charge_bump).state) < 0.01f);
+          if (x <= 0.0f) ESP_LOGI("profile", "🌙 Night bump → none");
+          else ESP_LOGI("profile", "🌙 Night bump → reserve +%.0f%%", x);
+      # Flush to flash now rather than at the next 5-minute preferences sync. This ESP
+      # restarts several times a day, and a restart inside that window restored the old
+      # value: the 07:05 reset of the night bump came back as 19% at 07:08 on 11 Oct.
+      # Delayed because the number saves its own value only after this action returns;
+      # skipped for rewrites of the same value, which HA sends every half hour.
+      - delay: 1s
+      - lambda: |-
+          if (id(prefs_flush_pending)) {
+            id(prefs_flush_pending) = false;
+            global_preferences->sync();
+          }
+
+  # SoC the battery needs for the outage blocks ahead, from Home Assistant's outage charge
+  # plan (docs/design/outage-charge-plan.md). 0 = no plan.
+  # Raises the night target (up to 100%) and, by day, starts a top-up below it (up to
+  # night_target_soc_max). HA rewrites it every 30 min; 12 h without a write and it is
+  # ignored (blackout::effective_plan_soc).
+
+  - platform: template
+    name: "Outage Plan SoC"
+    id: outage_plan_soc
+    unit_of_measurement: "%"
+    icon: "mdi:calendar-clock"
+    entity_category: config
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: box
+    set_action:
+      - lambda: |-
+          auto t = id(homeassistant_time).now();
+          id(outage_plan_set_epoch) = t.is_valid() ? (uint32_t) t.timestamp : 0;
+          id(prefs_flush_pending) = !(fabsf(x - id(outage_plan_soc).state) < 0.5f);
+          ESP_LOGI("plan", "📋 Outage plan → %.0f%%", x);
+      # Same as Night Charge Bump: flush a real change now, not at the next 5-min sync.
+      - delay: 1s
+      - lambda: |-
+          if (id(prefs_flush_pending)) {
+            id(prefs_flush_pending) = false;
+            global_preferences->sync();
+          }
+
+
+  - platform: template
+    name: "Battery Capacity"
+    id: battery_capacity_ah
+    unit_of_measurement: "Ah"
+    icon: "mdi:battery-plus"
+    entity_category: ""
+    min_value: 50
+    max_value: 400
+    step: 1
+    initial_value: 200
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  # ============ INVERTER MODBUS PARAMETERS ============
+
+select:
+  - platform: template
+    name: "Energy Strategy"
+    id: energy_strategy_select
+    icon: "mdi:home-battery"
+    entity_category: ""
+    optimistic: true
+    restore_value: true
+    initial_option: "Reserve"
+    options:
+      - "Sun"
+      - "Reserve"
+      - "Backup"
+    set_action:
+      - lambda: |-
+          uint8_t s = 1;
+          if (x == "Sun") s = 0;
+          else if (x == "Backup") s = 2;
+          id(energy_strategy) = s;
+
+          // Apply the inverter modes right away rather than waiting up to 90s for the
+          // idle block — switching strategy during an air raid should take effect now.
+          // Backup starts grid charge at once, with no grid-ready wait.
+          if (!id(charge_active) && !id(manual_charge_active) && !id(full_manual_mode)) {
+            if (s == 2) {
+              // Grid charge follows: the adapter writes the current limit first (the inverter may hold 80 A there).
+              id(cmd_house) = 1;
+              id(bi_house).execute(1);
+              id(cmd_charge_amps) = ${charge_amps_start};
+              id(bi_charge_limit).execute(${charge_amps_start});
+              id(bi_grid_permit).execute(true, false);
+              // Load-first solar aim is the safe aim in every strategy and at any hour — the interval
+              // lambda promotes it to battery-first within a cycle if the reserve needs rebuilding.
+              id(cmd_solar) = 0;
+              id(bi_solar_priority).execute(0);
+              // Backup idles on grid charge: its cut-off is the backup target, not the open ceiling.
+              id(active_stop_voltage) = blackout::charge_stop_voltage(${backup_target_soc}, ${battery_cells_s});
+              id(cmd_stop_soc) = ${backup_target_soc};
+              id(bi_charge_stop).execute(${backup_target_soc});
+            } else {
+              id(cmd_house) = 0;
+              id(bi_house).execute(0);
+              id(bi_grid_permit).execute(false, false);
+              id(cmd_solar) = 0;
+              id(bi_solar_priority).execute(0);
+              id(active_stop_voltage) = blackout::max_stop_voltage(${battery_cells_s});
+              id(cmd_stop_soc) = 100.0f;
+              id(bi_charge_stop).execute(100.0f);
+            }
+          }
+
+          // A session already running keeps charging, but to the new strategy's ceiling.
+          // Only Backup raises it: a daytime rebuild to a 45% reserve must not become a charge
+          // to 90% at the day rate because the strategy was changed meanwhile.
+          if (s == 2 && id(charge_active) && !id(manual_charge_active)) {
+            float target = ${backup_target_soc};
+            if (target > id(active_target_soc)) {
+              id(active_target_soc) = target;
+              float v = blackout::charge_stop_voltage(target, ${battery_cells_s});
+              id(active_stop_voltage) = v;
+              id(cmd_stop_soc) = target;
+              id(bi_charge_stop).execute(target);
+            }
+          }
+
+          ESP_LOGI("strategy", "🔀 Energy strategy: %s", x.c_str());
+          if (!id(bi_in_pass)) id(bi_sync).execute();  // else the pass syncs on exit
+
+
+globals:
+  - id: charge_active
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+  # 0 = Sun, 1 = Reserve, 2 = Backup. Set by the Energy Strategy select.
+
+  - id: energy_strategy
+    type: uint8_t
+    restore_value: yes
+    initial_value: '1'
+
+
+  - id: manual_charge_active
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+
+  - id: night_charge_automation_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+
+  - id: emergency_charge_automation_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+
+  - id: battery_protection_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+
+  - id: full_manual_mode
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+
+  - id: auto_disable_manual_charge
+    type: bool
+    restore_value: yes
+    initial_value: 'false'
+
+
+  - id: target_charge_amps
+    type: float
+    restore_value: yes
+    initial_value: '20.0'
+
+
+  - id: active_stop_voltage
+    type: float
+    restore_value: yes
+    initial_value: 'blackout::max_stop_voltage(${battery_cells_s})'
+
+  # SoC at which the currently running charge session ends. Every path that starts a
+  # charge (night, daytime rebuild, post-outage, backup, critical) records its own
+  # target here, so a single stop rule serves all of them.
+
+  - id: active_target_soc
+    type: float
+    restore_value: yes
+    initial_value: '${reserve_soc_max}'
+
+  # ============ LEARNED HOURLY LOAD PROFILE ============
+  # Average load per hour-of-day in 20 W steps (blackout::HOURLY_LOAD_STEP_W).
+  # uint8_t rather than float so the whole profile is 24 bytes in flash-backed
+  # preferences. 0 = that hour has not been observed yet.
+  #
+  # std::array, not a raw uint8_t[24]: RestoringGlobalsComponent takes its initial value
+  # by value, and a raw array decays to a pointer there —
+  #   "incompatible types in assignment of 'unsigned char*' to 'unsigned char [24]'".
+  # Only the non-restoring GlobalsComponent has an overload for C arrays.
+
+  - id: hourly_load_profile
+    type: std::array<uint8_t, 24>
+    restore_value: yes
+    initial_value: 'std::array<uint8_t, 24>{}'
+
+  - id: heal_streak
+    type: uint8_t
+    restore_value: yes
+    initial_value: '0'
+
+  # Set by SELF-HEAL when Home Assistant has been out of reach for
+  # ha_absent_worst_case_minutes; read wherever the reserve hours are worked out.
+
+  - id: self_restart_reason
+    type: uint8_t
+    restore_value: yes
+    initial_value: '0'
+
+  # Set by the Reserve Autonomy Target / Night Charge Bump set_actions when the value
+  # really changed; the delayed half of the action then forces a preferences flush.
+
+  - id: web_ui_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+
+  - id: nightly_restart_enabled
+    type: bool
+    restore_value: yes
+    initial_value: 'true'
+
+
+  - id: night_bump_set_epoch
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+
+  # Epoch seconds of the last write to Outage Plan SoC; see blackout::effective_plan_soc.
+
+  - id: outage_plan_set_epoch
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+
+  # Relay-trip learning (see relay_trip_return_minutes). Not restored: a restart forgets the
+  # cap, which only costs charge speed, and the flash layout of restored values stays as is.
+
+  - id: daily_load_saved_w
+    type: uint16_t
+    restore_value: yes
+    initial_value: '0'
+
+
+  - id: outage_seconds_today
+    type: unsigned long
+    restore_value: yes
+    initial_value: '0'
+
+  - id: outage_count_today
+    type: uint16_t
+    restore_value: yes
+    initial_value: '0'
+
+
+  - id: outage_stats_day
+    type: int8_t
+    restore_value: yes
+    initial_value: '-1'
+
+  # Set when the grid comes back after an outage: allows a top-up to the reserve
+  # outside the night window, because under rolling blackouts the night window may
+  # simply not happen.

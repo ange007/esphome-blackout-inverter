@@ -1,0 +1,133 @@
+alias: Battery Reserve From Outage Schedule
+description: >-
+  Sizes the ESP's reserve from the published outage schedule instead of letting it guess.
+
+  Without this the ESP defends a fixed number of hours from the Energy Strategy preset.
+  With it, the reserve tracks the longest outage still ahead in the next 24h — no outages
+  means the battery is free to work; an 8-hour block means the reserve rises to match
+  before it starts.
+
+  Writes number.blackout_inverter_reserve_autonomy_target. Value 0 hands control back to the
+  strategy preset. It never touches the Energy Strategy select — Backup stays yours.
+triggers:
+  # Safety net and keep-alive: the ESP trusts a written value for 12 h only (see
+  # reserve_override_ttl_hours), so a non-zero target is re-sent on every run.
+  - trigger: time_pattern
+    minutes: "/30"
+    id: periodic
+  # Event-driven, so the reserve moves when the schedule does rather than up to half an
+  # hour later. On 8-9 Oct emergency outages were picked up 1-21 min late, and the reserve
+  # was still sized for a block that had already ended when the grid came back.
+  - trigger: state
+    entity_id:
+      - binary_sensor.svitlo_region_queue_emergency_outages
+      - calendar.svitlo_region_queue_outages_schedule
+      - sensor.svitlo_region_queue_next_outage
+      # These two change when svitlo republishes the schedule — including an edit that
+      # extends a block already in progress, which none of the others notice.
+      - sensor.svitlo_region_queue_total_outage_today
+      - sensor.svitlo_region_queue_total_outage_tomorrow
+    # State changes only. svitlo rewrites the calendar's attributes on every 10-minute
+    # poll, and without this each rewrite ran the whole automation (11 Oct: every 10 min
+    # all day). `to: null` ignores attribute-only updates.
+    to: null
+    id: schedule
+  - trigger: homeassistant
+    event: start
+    id: startup
+conditions: []
+actions:
+  - variables:
+      # ── USER CONFIGURABLE ────────────────────────────────────────────────────
+      # Your queue's entities. svitlo_live names them after oblast + queue number, so
+      # check Developer Tools → States if you are on a different queue.
+      # Any integration exposing an outage calendar works (yasno_outages, …).
+      outage_calendar: calendar.svitlo_region_queue_outages_schedule
+      emergency_sensor: binary_sensor.svitlo_region_queue_emergency_outages
+      # Emergency outages are unscheduled and open-ended — assume the worst.
+      emergency_hours: 10
+      # Never ask for less than this when an outage IS scheduled, and never more than
+      # the pack can plausibly deliver. Above max_hours the ESP just clamps at
+      # reserve_soc_max anyway, so asking for more only muddies the logs.
+      min_hours: 2
+      max_hours: 10
+      # Charging has to finish before the block starts, so aim a little past its length.
+      margin_hours: 0.5
+      # Blocks closer together than this count as one: the battery cannot meaningfully
+      # recharge in the gap (20:30-00:00 and 00:09-00:30 on 7-8 Oct were one outage).
+      merge_gap_hours: 1
+      # ────────────────────────────────────────────────────────────────────────
+  - action: calendar.get_events
+    target:
+      entity_id: "{{ outage_calendar }}"
+    data:
+      duration:
+        hours: 24
+    response_variable: schedule
+    # A failed call must not abort the run with an error; it stops quietly below instead.
+    continue_on_error: true
+  # No response: keep the previous value. The ESP drops a target not refreshed for 12 h,
+  # which covers a long failure.
+  - condition: template
+    value_template: "{{ schedule is defined and schedule is mapping and outage_calendar in schedule }}"
+  - variables:
+      events: "{{ schedule[outage_calendar].events | default([], true) }}"
+      # Longest stretch without power still AHEAD of us in the window. Not the total:
+      # the battery has to survive one outage and then gets a chance to recharge between
+      # blocks. Only the part after now counts — get_events returns a block in progress
+      # with its full length, which kept the reserve sized for hours already gone.
+      longest_h: >-
+        {% set now_ts = as_timestamp(now()) %}
+        {% set horizon = now_ts + 24 * 3600 %}
+        {% set gap = merge_gap_hours * 3600 %}
+        {% set ns = namespace(s = 0, e = 0, longest = 0) %}
+        {% for ev in events | sort(attribute = 'start') %}
+          {% set s = [as_timestamp(ev.start), now_ts] | max %}
+          {% set e = [as_timestamp(ev.end), horizon] | min %}
+          {% if e > s %}
+            {% if ns.e > 0 and s - ns.e <= gap %}
+              {% set ns.e = [ns.e, e] | max %}
+            {% else %}
+              {% set ns.longest = [ns.longest, (ns.e - ns.s) / 3600] | max %}
+              {% set ns.s = s %}
+              {% set ns.e = e %}
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+        {{ [ns.longest, (ns.e - ns.s) / 3600] | max | round(2) }}
+      target_h: >-
+        {% if is_state(emergency_sensor, 'on') %}
+          {{ emergency_hours }}
+        {% elif longest_h | float(0) <= 0 %}
+          0
+        {% else %}
+          {#- Up to the next half hour (the ESP number's step): HA's round is half-even, and a
+              reserve target must not be rounded down. -#}
+          {{ (([[longest_h | float(0) + margin_hours, min_hours] | max, max_hours] | min) * 2) | round(0, 'ceil') / 2 }}
+        {% endif %}
+      current_h: "{{ states('number.blackout_inverter_reserve_autonomy_target') | float(-1) }}"
+  - condition: template
+    # Write on any change, and re-send a non-zero target every run to keep the ESP's
+    # 12 h freshness window open. Writing "0" over "0" is the only skipped case.
+    value_template: "{{ current_h != (target_h | float(0)) or (target_h | float(0)) > 0 }}"
+  - action: number.set_value
+    target:
+      entity_id: number.blackout_inverter_reserve_autonomy_target
+    data:
+      value: "{{ target_h | float(0) }}"
+  - if:
+      - condition: template
+        value_template: "{{ current_h != (target_h | float(0)) }}"
+    then:
+      - action: system_log.write
+        data:
+          level: info
+          message: >-
+            RESERVE AUTONOMY {{ current_h }}h → {{ target_h | float(0) }}h
+            (trigger={{ trigger.id }},
+            emergency={{ states(emergency_sensor) }},
+            blocks={{ events | count }},
+            longest_ahead={{ longest_h | float(0) | round(1) }}h)
+mode: queued
+max: 3
+max_exceeded: silent

@@ -1,0 +1,962 @@
+# MUST PV18 adapter — extracted inverter-specific parts.
+# UART, Modbus controller, and all Modbus entities.
+
+# The contract surface (bi_* scripts, reconcile, read-back sensors) is shared by the
+# Voltronic-family adapters; this file only declares the entities it drives.
+packages:
+  sync: !include
+    file: common/voltronic-sync.yaml
+    vars:
+      adapter_name: "MUST PV18"
+      cap_solar_aim: "1"
+      cap_grid_only: "1"
+      stop_by_soc: "0"
+      writes_enabled: "1"   # tested on a live unit
+
+uart:
+  id: mod_bus
+  tx_pin: ${tx_pin}
+  rx_pin: ${rx_pin}
+  baud_rate: 19200
+  stop_bits: 1
+  parity: NONE
+  data_bits: 8
+
+
+modbus:
+  id: mod_bus_must
+  send_wait_time: 350ms
+  flow_control_pin: ${flow_control_pin}
+
+
+modbus_controller:
+  - id: must
+    address: 0x4
+    modbus_id: mod_bus_must
+    setup_priority: -10
+    update_interval: ${updates}
+
+
+number:
+  - platform: modbus_controller
+    modbus_controller_id: must
+    id: grid_charger_amps
+    name: "Max Grid Charger current"
+    unit_of_measurement: "A"
+    address: 20125
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+    entity_category: config
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    id: batt_float_voltage
+    name: "Float voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 10103
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    id: batt_absorb_voltage
+    name: "Absorb voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 10104
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    name: "Max Combine Charger current"
+    unit_of_measurement: "A"
+    entity_category: config
+    address: 20132
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+
+  # ============ BMS PROTECTION PARAMETERS ============
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    id: batt_stop_dischg
+    name: "Battery stop discharging voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 20118
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    id: batt_stop_chg
+    name: "Battery stop charging voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 20119
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    id: batt_low_voltage
+    name: "Battery low voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 20127
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    id: batt_high_voltage
+    name: "Battery high voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 20128
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+
+
+
+select:
+  - platform: modbus_controller
+    modbus_controller_id: must
+    id: energy_use_mode
+    name: "Energy use mode (parameter 00)"
+    address: 20109
+    entity_category: config
+    optionsmap:
+      "SBU (Solar/battery/utility)": 1
+      "SUB (Solar/utility/battery)": 2
+      "UTI (Utility only)": 3
+      "SOL (Solar only)": 4
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    id: charger_source_priority
+    name: "Charger source priority (parameter 10)"
+    address: 20143
+    entity_category: config
+    optionsmap:
+      "CSO (Solar first)": 0
+      "SNU (Solar and utility)": 2
+      "OSO (Solar only)": 3
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    id: solar_use_aim
+    name: "Solar Use Aim"
+    address: 20112
+    entity_category: config
+    optionsmap:
+      "LBU (Load, Battery, Utility)": 0
+      "BLU (Battery, Load, Utility)": 1
+
+  # ============ ENERGY STRATEGY ============
+  # Replaces the old "Winter Mode" and "Battery Preserve Mode" switches. All three
+  # options run the same reserve logic; they differ in how much autonomy the reserve
+  # has to cover and how eagerly the grid is used to rebuild it.
+  #
+  #   Sun     ${reserve_hours_sun}h of autonomy. Solar covers the day, the battery is a
+  #           night buffer. The grid is essentially never used to charge.
+  #   Reserve ${reserve_hours_reserve}h of autonomy — one rolling-blackout block. The
+  #           battery works freely above the reserve; the grid only refills it.
+  #   Backup  Battery held at ${backup_target_soc}% and not discharged, grid carries the
+  #           house. UPS behaviour for unscheduled outages.
+
+
+text_sensor:
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 15201
+    name: "Charger Workstate"
+    icon: mdi:battery-charging-50
+    register_type: holding
+    raw_encode: HEXBYTES
+    lambda: |-
+      uint16_t value = modbus::helpers::word_from_hex_str(x, 0);
+      switch (value) {
+        case 0: return std::string("Init");
+        case 1: return std::string("Test");
+        case 2: return std::string("Work");
+        case 3: return std::string("Stop");
+        default: return std::string("Unknown");
+      }
+      return x;
+
+  # Charger Error (reg 15213) decoded per MUST protocol 1.4.15 "PV Charger Alarm".
+  # Bit5 = "PV voltage too low" — the normal night state (no sun), reported as benign.
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 15213
+    name: "Charger Error (decoded)"
+    icon: "mdi:alert-circle-outline"
+    register_type: holding
+    raw_encode: HEXBYTES
+    lambda: |-
+      uint16_t v = modbus::helpers::word_from_hex_str(x, 0);
+      const char* bits[10] = {
+        "Hardware protection", "Over current", "Current sensor error",
+        "Over temperature", "PV voltage too high", "PV voltage too low",
+        "Battery voltage too high", "Battery voltage too low",
+        "Current uncontrollable", "Parameter error"
+      };
+      // bit5 (PV voltage too low) is benign at night — collect real faults separately
+      std::string faults = "";
+      bool pv_low = (v & (1 << 5));
+      for (int i = 0; i < 10; i++) {
+        if (i == 5) continue;
+        if (v & (1 << i)) {
+          if (!faults.empty()) faults += ", ";
+          faults += bits[i];
+        }
+      }
+      if (!faults.empty()) return faults;
+      if (pv_low) return std::string("OK (no PV input)");
+      return std::string("OK");
+
+  # Charger Warning (reg 15214): only bit0 is defined (Fan Error), rest reserved.
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 15214
+    name: "Charger Warning (decoded)"
+    disabled_by_default: true
+    icon: "mdi:alert-outline"
+    register_type: holding
+    raw_encode: HEXBYTES
+    lambda: |-
+      uint16_t v = modbus::helpers::word_from_hex_str(x, 0);
+      if (v & (1 << 0)) return std::string("Fan Error");
+      return std::string("OK");
+
+  # Inverter Error message 1 (reg 25261) decoded per MUST protocol 1.4.15 "Inverter Alarm".
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25261
+    name: "Inverter Error 1 (decoded)"
+    disabled_by_default: true
+    icon: "mdi:alert-circle-outline"
+    register_type: holding
+    raw_encode: HEXBYTES
+    lambda: |-
+      uint16_t v = modbus::helpers::word_from_hex_str(x, 0);
+      const char* bits[16] = {
+        "Fan locked (inverter off)", "Transformer over temperature",
+        "Battery voltage too high", "Battery voltage too low",
+        "Output short circuited", "Output voltage high", "Overload time out",
+        "Bus voltage too high", "Bus soft start failed", "Main relay failed",
+        "Output voltage sensor error", "Grid voltage sensor error",
+        "Output current sensor error", "Grid current sensor error",
+        "Load current sensor error", "Grid over current error"
+      };
+      std::string s = "";
+      for (int i = 0; i < 16; i++) if (v & (1 << i)) { if (!s.empty()) s += ", "; s += bits[i]; }
+      return s.empty() ? std::string("OK") : s;
+
+  # Inverter Error message 2 (reg 25262) decoded per MUST protocol 1.4.15 "Inverter Alarm".
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25262
+    name: "Inverter Error 2 (decoded)"
+    disabled_by_default: true
+    icon: "mdi:alert-circle-outline"
+    register_type: holding
+    raw_encode: HEXBYTES
+    lambda: |-
+      uint16_t v = modbus::helpers::word_from_hex_str(x, 0);
+      const char* bits[16] = {
+        "Radiator over temperature", "Solar charger battery voltage class error",
+        "Solar charger current sensor error", "Solar charger current uncontrollable",
+        "Grid voltage low", "Grid voltage high", "Grid under frequency",
+        "Grid over frequency", "Over current protection error", "Bus voltage too low",
+        "Soft start failed", "Over DC voltage in AC output", "Battery connection open",
+        "Control current sensor error", "Output voltage too low", "reserved"
+      };
+      std::string s = "";
+      for (int i = 0; i < 16; i++) if (v & (1 << i)) { if (!s.empty()) s += ", "; s += bits[i]; }
+      return s.empty() ? std::string("OK") : s;
+
+  # Inverter Warning message 1 (reg 25265) decoded per MUST protocol 1.4.15 "Inverter Alarm".
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25265
+    name: "Inverter Warning 1 (decoded)"
+    disabled_by_default: true
+    icon: "mdi:alert-outline"
+    register_type: holding
+    raw_encode: HEXBYTES
+    lambda: |-
+      uint16_t v = modbus::helpers::word_from_hex_str(x, 0);
+      const char* bits[11] = {
+        "Fan locked (inverter on)", "Fan2 locked (inverter on)",
+        "Battery over-charged", "Low battery", "Overload",
+        "Output power derating", "Solar charger stopped: low battery",
+        "Solar charger stopped: high PV voltage", "Solar charger stopped: over load",
+        "Solar charger over temperature", "PV charger communication error"
+      };
+      std::string s = "";
+      for (int i = 0; i < 11; i++) if (v & (1 << i)) { if (!s.empty()) s += ", "; s += bits[i]; }
+      return s.empty() ? std::string("OK") : s;
+
+  # Learned average load per hour-of-day, "00:W,01:W,...". Disabled by default — it is
+  # a diagnostic, but a useful one: it shows which hours an outage would actually cost
+  # the most, which is exactly what sizes the reserve.
+
+
+sensor:
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 44180
+    id: battery_state_of_charge
+    name: "Battery State of Charge"
+    register_type: holding
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+    value_type: U_WORD
+    on_value:
+      - lambda: 'id(last_soc_update_ms) = millis(); id(bi_data_ms) = millis();'
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 15202
+    name: "MPPT State"
+    register_type: holding
+    entity_category: diagnostic
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 15203
+    name: "Charging State"
+    register_type: holding
+    entity_category: diagnostic
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25261
+    name: "Inverter Error 1"
+    register_type: holding
+    entity_category: diagnostic
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25262
+    name: "Inverter Error 2"
+    register_type: holding
+    entity_category: diagnostic
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25263
+    name: "Inverter Error 3"
+    register_type: holding
+    entity_category: diagnostic
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25265
+    name: "Inverter Warning 1"
+    register_type: holding
+    entity_category: diagnostic
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25266
+    name: "Inverter Warning 2"
+    register_type: holding
+    entity_category: diagnostic
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 15213
+    bitmask: 0x3ff
+    name: "Charger Error"
+    register_type: holding
+    entity_category: diagnostic
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 15214
+    name: "Charger Warning"
+    register_type: holding
+    entity_category: diagnostic
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 15206
+    name: "Battery Voltage (charger)"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: holding
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 15205
+    name: "PV1 Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: holding
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 15207
+    name: "PV1 Current"
+    disabled_by_default: true
+    unit_of_measurement: "A"
+    device_class: current
+    register_type: holding
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 15208
+    id: pv1_power_sensor
+    name: "PV1 Power"
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: holding
+    accuracy_decimals: 0
+    state_class: measurement
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 15211
+    name: "Battery Relay"
+    register_type: holding
+    entity_category: diagnostic
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 15217
+    id: charger_total_mwh
+    register_type: holding
+    internal: true
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 15218
+    id: charger_total_kwh
+    register_type: holding
+    internal: true
+    filters:
+      - multiply: 0.1
+
+
+  - platform: template
+    name: "Accumulated Solar Power"
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    entity_category: diagnostic
+    lambda: |-
+      return (id(charger_total_mwh).state * 1000.0 + id(charger_total_kwh).state);
+    accuracy_decimals: 1
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25201
+    name: "Inverter Work State"
+    register_type: holding
+    entity_category: diagnostic
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25205
+    id: battery_voltage_sensor
+    name: "Battery voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: holding
+    accuracy_decimals: 2
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25206
+    name: "Inverter voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: holding
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25207
+    id: grid_voltage_sensor
+    name: "Grid voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: holding
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25213
+    id: inverter_power_sensor
+    # Apparent power (VA), not real power: measured 561 against 2.45 A x 228 V = 558 VA
+    # on a sub-circuit meter reading 501 W at the same moment. Fine for the load figure
+    # below, where it is differenced against grid_power, but do not treat it as watts
+    # when calibrating efficiency.
+    name: "Inverter power"
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: holding
+    value_type: S_WORD
+    accuracy_decimals: 0
+    state_class: measurement
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25214
+    id: grid_power_sensor
+    name: "Grid power"
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: holding
+    value_type: S_WORD
+    accuracy_decimals: 0
+    state_class: measurement
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25215
+    id: load_power_sensor
+    # Direct load measurement, read on the device as a last-resort floor for
+    # [EH] Load Power. It under-reads a little, but it survives bypass — before the
+    # grid_power sign was fixed it was the only register still reporting the real load
+    # there. Hidden in HA because [EH] Load Power is the one to watch; the lambda reads
+    # it regardless of whether the entity is enabled.
+    name: "Load power"
+    disabled_by_default: true
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: holding
+    accuracy_decimals: 0
+    state_class: measurement
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25216
+    name: "System load"
+    unit_of_measurement: "%"
+    register_type: holding
+    accuracy_decimals: 0
+    state_class: measurement
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25233
+    name: "AC radiator temp"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    register_type: holding
+    accuracy_decimals: 0
+    state_class: measurement
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25234
+    name: "Transformer temp"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    register_type: holding
+    accuracy_decimals: 0
+    state_class: measurement
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25235
+    name: "DC Radiator temp"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    register_type: holding
+    accuracy_decimals: 0
+    state_class: measurement
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25247
+    id: discharger_total_mwh
+    register_type: holding
+    internal: true
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25248
+    id: discharger_total_kwh
+    register_type: holding
+    internal: true
+    filters:
+      - multiply: 0.1
+
+
+  - platform: template
+    name: "Accumulated Discharger Power"
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    entity_category: diagnostic
+    lambda: |-
+      return (id(discharger_total_mwh).state * 1000.0 + id(discharger_total_kwh).state);
+    accuracy_decimals: 1
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25249
+    id: buy_mwh
+    register_type: holding
+    internal: true
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25250
+    id: buy_kwh
+    register_type: holding
+    internal: true
+    filters:
+      - multiply: 0.1
+
+
+  - platform: template
+    name: "Accumulated Buy Power"
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    entity_category: diagnostic
+    lambda: |-
+      return (id(buy_mwh).state * 1000.0 + id(buy_kwh).state);
+    accuracy_decimals: 1
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25251
+    id: sell_mwh
+    register_type: holding
+    internal: true
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25252
+    id: sell_kwh
+    register_type: holding
+    internal: true
+    filters:
+      - multiply: 0.1
+
+
+  - platform: template
+    name: "Accumulated Sell Power"
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    entity_category: diagnostic
+    lambda: |-
+      return (id(sell_mwh).state * 1000.0 + id(sell_kwh).state);
+    accuracy_decimals: 1
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25253
+    id: load_mwh
+    register_type: holding
+    internal: true
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25254
+    id: load_kwh
+    register_type: holding
+    internal: true
+    filters:
+      - multiply: 0.1
+
+
+  - platform: template
+    name: "Accumulated Load Power"
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    entity_category: diagnostic
+    lambda: |-
+      return (id(load_mwh).state * 1000.0 + id(load_kwh).state);
+    accuracy_decimals: 1
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25259
+    id: grid_charge_mwh
+    register_type: holding
+    internal: true
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25260
+    id: grid_charge_kwh
+    register_type: holding
+    internal: true
+    filters:
+      - multiply: 0.1
+
+
+  - platform: template
+    name: "Accumulated Grid Charge Power"
+    unit_of_measurement: kWh
+    device_class: energy
+    state_class: total_increasing
+    entity_category: diagnostic
+    lambda: |-
+      return (id(grid_charge_mwh).state * 1000.0 + id(grid_charge_kwh).state);
+    accuracy_decimals: 1
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25273
+    id: battery_power
+    name: "Battery power"
+    # Charger-side reg — unreliable for battery accounting (see net sensors). Diagnostic only.
+    disabled_by_default: true
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: holding
+    value_type: S_WORD
+    accuracy_decimals: 0
+    state_class: measurement
+
+
+  - platform: modbus_controller
+    modbus_controller_id: must
+    address: 25274
+    id: battery_current
+    name: "Battery current"
+    # Charger-side reg — unreliable for battery accounting. Diagnostic only.
+    disabled_by_default: true
+    unit_of_measurement: "A"
+    device_class: current
+    register_type: holding
+    value_type: S_WORD
+    accuracy_decimals: 1
+    state_class: measurement
+
+  # Contract readings (bi_*). Fixed ids for the core; each mirrors one MUST
+  # entity (or a trivial derived quantity) and holds NAN while unavailable.
+  # Internal + 60 s (Task 7b RAM): core reads id().state locally, so HA
+  # publishing is pure overhead; 60 s halved the polling rate. bi_data_ms
+  # (the staleness clock) is driven by on_value above, not by these.
+  - platform: template
+    id: bi_soc
+    internal: true
+    name: "BI SoC"
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(battery_state_of_charge).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_battery_voltage
+    internal: true
+    name: "BI Battery voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 2
+    lambda: |-
+      float v = id(battery_voltage_sensor).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_battery_power
+    internal: true
+    name: "BI Battery power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(battery_power).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_grid_voltage
+    internal: true
+    name: "BI Grid voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 1
+    lambda: |-
+      float v = id(grid_voltage_sensor).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_load_power
+    internal: true
+    name: "BI Load power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(load_power_sensor).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_pv_power
+    internal: true
+    name: "BI PV power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(pv1_power_sensor).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_grid_power
+    internal: true
+    name: "BI Grid power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float g = id(grid_power_sensor).state;
+      if (isnan(g)) return NAN;
+      return g < 0.0f ? -g : 0.0f;
+
+  - platform: template
+    id: bi_battery_current
+    internal: true
+    name: "BI Battery current"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 1
+    lambda: |-
+      float v = id(battery_current).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_grid_present
+    internal: true
+    name: "BI Grid present"
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(grid_voltage_sensor).state;
+      if (isnan(v)) return NAN;
+      return v > 150.0f ? 1.0f : 0.0f;
+
+  - platform: template
+    id: bi_charger_state
+    internal: true
+    name: "BI Charger state"
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float i = id(battery_current).state;
+      float v = id(battery_voltage_sensor).state;
+      float stop = id(batt_stop_chg).state;
+      if (isnan(i) || isnan(v)) return NAN;
+      if (!isnan(stop) && v >= stop - 0.2f && i < 2.0f) return 2.0f;
+      return i > 0.5f ? 1.0f : 0.0f;

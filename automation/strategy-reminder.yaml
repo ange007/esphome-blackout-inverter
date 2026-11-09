@@ -1,0 +1,92 @@
+# Home Assistant automation (paste into automations.yaml, or the UI's YAML editor).
+alias: Energy Strategy Reminder
+description: >-
+  Weekly nudge to switch the inverter's Energy Strategy by hand: to Sun once the panels have
+  covered the whole day's load 7 days running, back to Reserve once they fall short (under 80%
+  of the load) on 3 of the last 7 days. Sun gives up only the 6 h preset reserve (outage
+  schedule, emergency hours and the outage plan still apply); in summer that reserve never
+  binds and holding it cost ~12 day-rate kWh a season on the reference install.
+  Notification only, changes nothing.
+triggers:
+  - trigger: time
+    at: "20:00:00"
+conditions:
+  - condition: time
+    weekday: sun
+  - condition: state
+    entity_id: select.blackout_inverter_energy_strategy
+    state:
+      - Reserve
+      - Sun
+actions:
+  # Daily means of the hourly statistics (kept forever), not the ESP's daily energy
+  # counters: those restart from zero on every ESP reboot. The day buckets are offset from
+  # local midnight, so the range returns 8; the last 7 are kept.
+  - action: recorder.get_statistics
+    data:
+      statistic_ids:
+        - sensor.blackout_inverter_pv1_power
+        - sensor.blackout_inverter_eh_load_power
+      start_time: "{{ (today_at() - timedelta(days=7)).isoformat() }}"
+      end_time: "{{ today_at().isoformat() }}"
+      period: day
+      types:
+        - mean
+    response_variable: stats
+  - variables:
+      pv_kwh: >-
+        {{ ((stats.statistics['sensor.blackout_inverter_pv1_power'] | default([]))
+           | map(attribute='mean') | map('float', 0) | map('multiply', 0.024) | list)[-7:] }}
+      load_kwh: >-
+        {{ ((stats.statistics['sensor.blackout_inverter_eh_load_power'] | default([]))
+           | map(attribute='mean') | map('float', 0) | map('multiply', 0.024) | list)[-7:] }}
+      days: "{{ [pv_kwh | count, load_kwh | count] | min }}"
+      covered: >-
+        {% set ns = namespace(n=0) %}
+        {% for i in range(days | int) %}{% if pv_kwh[i] >= load_kwh[i] %}{% set ns.n = ns.n + 1 %}{% endif %}{% endfor %}
+        {{ ns.n }}
+      short: >-
+        {% set ns = namespace(n=0) %}
+        {% for i in range(days | int) %}{% if pv_kwh[i] < 0.8 * load_kwh[i] %}{% set ns.n = ns.n + 1 %}{% endif %}{% endfor %}
+        {{ ns.n }}
+      summary: >-
+        {{ covered }} of {{ days }} days the panels covered the load
+        (PV {{ (pv_kwh | sum) | round(1) }} kWh, load {{ (load_kwh | sum) | round(1) }} kWh this week).
+  - choose:
+      - conditions:
+          - condition: state
+            entity_id: select.blackout_inverter_energy_strategy
+            state: Reserve
+          - condition: template
+            value_template: "{{ days | int >= 7 and covered | int >= days | int }}"
+        sequence:
+          - action: notify.notify
+            data:
+              title: "☀️ Time for the Sun strategy"
+              message: >-
+                {{ summary }} Switch Energy Strategy to Sun: the night hold drops to the 3 h
+                reserve and the morning sun gets room. Outage schedules still raise the reserve.
+          - action: persistent_notification.create
+            data:
+              notification_id: energy_strategy_reminder
+              title: "☀️ Time for the Sun strategy"
+              message: "{{ summary }} Switch Energy Strategy to Sun."
+      - conditions:
+          - condition: state
+            entity_id: select.blackout_inverter_energy_strategy
+            state: Sun
+          - condition: template
+            value_template: "{{ short | int >= 3 }}"
+        sequence:
+          - action: notify.notify
+            data:
+              title: "🔋 Back to the Reserve strategy"
+              message: >-
+                {{ summary }} {{ short }} days fell short. Switch Energy Strategy back to
+                Reserve: the sun no longer refills the pack, and Sun keeps only a 3 h reserve.
+          - action: persistent_notification.create
+            data:
+              notification_id: energy_strategy_reminder
+              title: "🔋 Back to the Reserve strategy"
+              message: "{{ summary }} Switch Energy Strategy back to Reserve."
+mode: single

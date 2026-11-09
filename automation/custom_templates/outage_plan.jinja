@@ -1,0 +1,99 @@
+{#-
+  outage_plan: the SoC the battery needs for the outage blocks ahead.
+  Design: docs/design/outage-charge-plan.md.
+
+  now_ts    epoch seconds
+  events    [{start, end}] ISO strings, the outage calendar for the next ~30 h
+  pv        {"YYYY-MM-DDTHH" (local): Wh} forecast for that hour, already x the learned factor
+  load      24 watts by local hour of day
+  pack_wh   battery capacity in Wh;  amps  grid charge current;  emergency  bool
+
+  Returns JSON: plan (target for the current grid window: at night the SoC to have when the
+  grid goes, by day the SoC needed now), need_now, need_at_outage, next_outage (epoch of the block start, or null),
+  day_grid (day-rate grid needed), feasible (25% holds even at 100%), outage_24h (outage hours in
+  the next 24 h, incl. the margin).
+
+  Backward pass from the horizon, starting at the floor. An outage hour adds
+  (load*1.2 - pv)/0.87 + 27 W; a grid hour subtracts its PV surplus, plus the charger at night
+  (and, in pass 2 only, by day). The current grid window counts no grid of its own by day.
+  Emergency: no future grid at all.
+  Heavy day: with heavy_h or more outage hours (incl. the margin) in the next 24 h, the night plan
+  is 100. The model ends at the horizon and trusts every grid window in the schedule; on such a
+  day the pack ends a block near the floor, and a grid window that does not come (extended
+  block, emergency cut) is then hours of darkness. The night rate makes the last 10% cheap.
+-#}
+{% macro outage_plan(now_ts, events, pv, load, pack_wh, amps, emergency, horizon_h=30, floor=25, margin_min=30, load_k=1.2, heavy_h=12) -%}
+{%- set h0 = (now_ts // 3600) * 3600 -%}
+{%- set b = namespace(l=[]) -%}
+{%- for ev in events -%}
+  {%- set s = as_timestamp(ev.start) -%}
+  {%- set e = as_timestamp(ev.end) + margin_min * 60 -%}
+  {%- if e > now_ts and s < h0 + horizon_h * 3600 -%}{%- set b.l = b.l + [[s, e]] -%}{%- endif -%}
+{%- endfor -%}
+{%- if b.l | count == 0 -%}
+{{ {'plan': 100 if emergency else 0, 'need_now': 0, 'need_at_outage': 0, 'next_outage': none, 'day_grid': false, 'feasible': true} | to_json }}
+{%- else -%}
+{%- set ns = namespace(slots=[], first_out=none) -%}
+{%- for i in range(horizon_h) -%}
+  {%- set t = h0 + i * 3600 -%}
+  {%- set a = [t, now_ts] | max -%}
+  {%- set t1 = t + 3600 -%}
+  {%- set o = namespace(sec=0) -%}
+  {%- for blk in b.l -%}
+    {%- set o.sec = o.sec + ([0, ([t1, blk[1]] | min) - ([a, blk[0]] | max)] | max) -%}
+  {%- endfor -%}
+  {%- set f = ([o.sec, t1 - a] | min) / 3600 -%}
+  {%- set g = (t1 - a) / 3600 - f -%}
+  {%- set hr = t | timestamp_custom('%H', true) | int -%}
+  {%- if ns.first_out is none and f > 0 -%}{%- set ns.first_out = i -%}{%- endif -%}
+  {%- set ns.slots = ns.slots + [{'i': i, 'f': f, 'g': g, 'night': hr >= 23 or hr < 7,
+      'l': (load[hr] | float(0)) * load_k,
+      'p': pv.get(t | timestamp_custom('%Y-%m-%dT%H', true), 0) | float(0)}] -%}
+{%- endfor -%}
+{%- set chg = 100 * amps * 53 * 0.7 / pack_wh -%}
+{%- set res = namespace(n1=0, o1=0, c1=false, n2=0, o2=0, c2=false) -%}
+{%- for pass in [1, 2] -%}
+  {%- set n = namespace(need=floor, capped=false, at_out=floor) -%}
+  {%- for s in ns.slots | reverse -%}
+    {%- if s.g > 0 -%}
+      {%- set rec = 100 * ([0, s.p - s.l] | max) * s.g * 0.95 / pack_wh -%}
+      {%- set current = s.i < ns.first_out -%}
+      {%- if not emergency and (s.night or (pass == 2 and not current)) -%}
+        {%- set rec = rec + chg * s.g -%}
+      {%- endif -%}
+      {%- set n.need = [floor, n.need - rec] | max -%}
+    {%- endif -%}
+    {%- if s.f > 0 -%}
+      {%- set net = (s.l - s.p) * s.f -%}
+      {%- if net > 0 -%}
+        {%- set n.need = n.need + 100 * (net / 0.87 + 27 * s.f) / pack_wh -%}
+      {%- else -%}
+        {%- set n.need = n.need + 100 * net * 0.95 / pack_wh -%}
+      {%- endif -%}
+      {#- A PV surplus in an outage hour must not take the need below the floor. -#}
+      {%- set n.need = [floor, n.need] | max -%}
+    {%- endif -%}
+    {%- if n.need > 100 -%}{%- set n.capped = true -%}{%- set n.need = 100 -%}{%- endif -%}
+    {%- if s.i == ns.first_out -%}{%- set n.at_out = n.need -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if pass == 1 -%}
+    {%- set res.n1 = n.need -%}{%- set res.o1 = n.at_out -%}{%- set res.c1 = n.capped -%}
+  {%- else -%}
+    {%- set res.n2 = n.need -%}{%- set res.o2 = n.at_out -%}{%- set res.c2 = n.capped -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set use2 = res.c1 and not emergency -%}
+{%- set need_now = res.n2 if use2 else res.n1 -%}
+{%- set at_out = res.o2 if use2 else res.o1 -%}
+{%- set hr_now = now_ts | timestamp_custom('%H', true) | int -%}
+{%- set now_night = hr_now >= 23 or hr_now < 7 -%}
+{%- set out_24h = ns.slots[:24] | sum(attribute='f') -%}
+{%- set heavy = out_24h >= heavy_h -%}
+{#- Emergency flag: power can go at any moment, so take the grid while it is there (night 100%, day 90%). -#}
+{#- Heavy day: the night plan goes to 100 (night rate only; by day the plan stays the need). -#}
+{{ {'plan': (100 if emergency or (heavy and now_night) else (at_out if now_night else need_now)) | round(1),
+    'need_now': need_now | round(1), 'need_at_outage': at_out | round(1),
+    'next_outage': b.l | map('first') | min, 'day_grid': use2,
+    'feasible': not (res.c2 if use2 else res.c1), 'outage_24h': out_24h | round(1)} | to_json }}
+{%- endif -%}
+{%- endmacro %}

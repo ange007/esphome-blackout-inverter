@@ -1,0 +1,38 @@
+# ESP8266 preference (flash) layout
+# restored items: 34  estimated words: 39
+# seq  id  kind  type  size_words
+   1  manual_charge_switch  switch  bool  1
+   2  night_charge_auto_switch  switch  bool  1
+   3  emergency_charge_auto_switch  switch  bool  1
+   4  battery_protection_switch  switch  bool  1
+   5  auto_disable_manual_switch  switch  bool  1
+   6  full_manual_mode_switch  switch  bool  1
+   7  manual_charge_amps_number  number  float  1
+   8  reserve_hours_number  number  float  1
+   9  night_charge_bump  number  float  1
+  10  outage_plan_soc  number  float  1
+  11  battery_capacity_ah  number  float  1
+  12  energy_strategy_select  select  uint8_t  1
+  13  charge_active  global  bool  1
+  14  energy_strategy  global  uint8_t  1
+  15  manual_charge_active  global  bool  1
+  16  night_charge_automation_enabled  global  bool  1
+  17  emergency_charge_automation_enabled  global  bool  1
+  18  battery_protection_enabled  global  bool  1
+  19  full_manual_mode  global  bool  1
+  20  auto_disable_manual_charge  global  bool  1
+  21  target_charge_amps  global  float  1
+  22  active_stop_voltage  global  float  1
+  23  active_target_soc  global  float  1
+  24  hourly_load_profile  global  std::array  6
+  25  heal_streak  global  uint8_t  1
+  26  self_restart_reason  global  uint8_t  1
+  27  web_ui_enabled  global  bool  1
+  28  nightly_restart_enabled  global  bool  1
+  29  night_bump_set_epoch  global  uint32_t  1
+  30  outage_plan_set_epoch  global  uint32_t  1
+  31  daily_load_saved_w  global  uint16_t  1
+  32  outage_seconds_today  global  uint32_t  1
+  33  outage_count_today  global  uint16_t  1
+  34  outage_stats_day  global  int8_t  1
+# layout_sha256: 2b59d20ab13f

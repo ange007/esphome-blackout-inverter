@@ -1,0 +1,184 @@
+# Needs the `mushroom` custom cards (HACS).
+#
+# Scope: only what you might change or check *right now*. Everything that gets set once,
+# or set by an automation, or is a diagnostic, lives at the bottom commented out — add it
+# back if you want it, but it does not belong on a glance view.
+#
+# Chips: every one carries its own word. A mushroom `entity` chip shows icon + state and
+# nothing else, which is how two different reserve figures both ended up reading "44%".
+# Each chip is also tappable for more-info — that is where the full entity name lives,
+# since chips have no tooltips.
+type: vertical-stack
+cards:
+  # ── Status, one row ──────────────────────────────────────────────────────────
+  - type: custom:mushroom-chips-card
+    alignment: start
+    chips:
+      # Is there power in the wires. The one thing you want to know first.
+      - type: template
+        entity: binary_sensor.blackout_inverter_eh_grid_present
+        icon: >-
+          {{ 'mdi:transmission-tower' if is_state(entity, 'on')
+             else 'mdi:transmission-tower-off' }}
+        icon_color: "{{ 'green' if is_state(entity, 'on') else 'red' }}"
+        content: "{{ 'Grid' if is_state(entity, 'on') else 'OUTAGE' }}"
+        tap_action:
+          action: more-info
+
+      # How long the battery alone would carry the house at the current load.
+      - type: template
+        entity: sensor.blackout_inverter_eh_battery_backup_autonomy
+        icon: mdi:timer-outline
+        icon_color: >-
+          {% set h = states(entity) | float(0) %}
+          {{ 'red' if h < 2 else 'orange' if h < 4 else 'green' }}
+        content: "{{ states(entity) | float(0) | round(1) }}h left"
+        tap_action:
+          action: more-info
+
+      # The line the battery is not supposed to fall below. Green above it, orange inside
+      # the hold band, red under it.
+      - type: template
+        entity: sensor.blackout_inverter_eh_reserve_target_soc
+        icon: mdi:battery-heart-variant
+        icon_color: >-
+          {% set soc = states('sensor.blackout_inverter_battery_state_of_charge') | float(0) %}
+          {% set r = states(entity) | float(0) %}
+          {{ 'green' if soc >= r else 'orange' if soc >= r - 10 else 'red' }}
+        content: "Reserve {{ states(entity) | float(0) | round(0) | int }}%"
+        tap_action:
+          action: more-info
+
+      # What the pack is being prepared for: the stop of the running session, otherwise
+      # the night target (peak reserve + margin + forecast bump, or the outage plan if
+      # higher). The Reserve chip is only "an outage starting this minute"; at night it
+      # reads low (quiet hours ahead) while this one shows the real aim.
+      - type: template
+        entity: sensor.blackout_inverter_eh_active_charge_limit
+        icon: mdi:battery-arrow-up
+        icon_color: >-
+          {% set soc = states('sensor.blackout_inverter_battery_state_of_charge') | float(0) %}
+          {{ 'green' if soc >= states(entity) | float(0) - 2 else 'blue' }}
+        content: >-
+          Target {{ states(entity) | float(0) | round(0) | int }}%{% if (states('sensor.outage_charge_plan') | float(0)) > 0 %} · plan {{ states('sensor.outage_charge_plan') | float(0) | round(0) | int }}%{% endif %}
+        tap_action:
+          action: more-info
+
+      # Charging or not, and at what current.
+      - type: template
+        entity: binary_sensor.blackout_inverter_eh_charging_active
+        icon: mdi:flash
+        icon_color: "{{ 'blue' if is_state(entity, 'on') else 'grey' }}"
+        content: >-
+          {% if is_state(entity, 'on') %}
+            {{ states('sensor.blackout_inverter_eh_active_charge_amps') | float(0) | round(0) | int }}A
+          {% else %}Idle{% endif %}
+        tap_action:
+          action: more-info
+
+  # ── State of charge ──────────────────────────────────────────────────────────
+  - type: sensor
+    entity: sensor.blackout_inverter_battery_state_of_charge
+    graph: line
+    detail: 2
+    hours_to_show: 24
+    name: State of Charge
+
+  # ── The three things worth a button ──────────────────────────────────────────
+  # No separate "night charge is off" warning card: the Night button below is the same
+  # entity, so the two sat one above the other saying the same thing — and briefly
+  # contradicting each other while the conditional re-evaluated. Mushroom already dims
+  # the icon and prints the state under the name, which is warning enough.
+  #
+  # Worth knowing after an upgrade: the old seasonal automation switched night charge off
+  # at 07:05 every morning and the new one never touches it, so it can be left off.
+  # Vertical layout keeps the labels readable in a narrow column; horizontal tiles cut
+  # them to "Char...".
+  - type: grid
+    columns: 3
+    square: false
+    cards:
+      - type: custom:mushroom-entity-card
+        entity: switch.blackout_inverter_automation_night_charge
+        name: Night
+        icon: mdi:weather-night
+        layout: vertical
+        tap_action:
+          action: toggle
+        hold_action:
+          action: more-info
+
+      - type: custom:mushroom-entity-card
+        entity: switch.blackout_inverter_manual_charge
+        name: Manual
+        icon: mdi:hand-back-right
+        layout: vertical
+        tap_action:
+          action: toggle
+        hold_action:
+          action: more-info
+
+      - type: custom:mushroom-number-card
+        entity: number.blackout_inverter_target_charge_current
+        name: Current
+        icon: mdi:lightning-bolt
+        layout: vertical
+        display_mode: buttons
+        secondary_info: none
+
+  # ── Strategy ─────────────────────────────────────────────────────────────────
+  # A plain entities row rather than a mushroom select card: same dropdown, a third of
+  # the height, and "Reserve"/"Backup" never get truncated.
+  - type: entities
+    entities:
+      - entity: select.blackout_inverter_energy_strategy
+        name: Strategy
+
+  # ── Optional ─────────────────────────────────────────────────────────────────
+  # Set-once settings, automation-driven values and diagnostics. All reachable from the
+  # device page; uncomment whatever you want permanently visible.
+  #
+  # - type: entities
+  #   title: Reserve
+  #   state_color: true
+  #   entities:
+  #     # Written by the outage-schedule automation. 0 = follow the strategy preset.
+  #     - entity: number.blackout_inverter_reserve_autonomy_target
+  #       name: Autonomy target
+  #     # Written by Battery Smart Management at 22:00 from tomorrow's forecast:
+  #     # the shortfall the sun will not cover, as a percentage of the pack.
+  #     - entity: number.blackout_inverter_night_charge_bump
+  #       name: Night bump
+  #     - entity: number.blackout_inverter_battery_capacity
+  #       name: Battery capacity
+  #     - type: section
+  #     # What night charging aims at: the worst N-hour window of the coming day, as
+  #     # opposed to the "Reserve" chip, which is the next N hours from now.
+  #     - entity: sensor.blackout_inverter_eh_reserve_peak_soc
+  #       name: Reserve (peak window)
+  #     - entity: sensor.blackout_inverter_eh_active_charge_limit
+  #       name: Charge stops at
+  #     - entity: sensor.blackout_inverter_eh_active_discharge_limit
+  #       name: Battery held above
+  #     - entity: sensor.blackout_inverter_eh_average_load_power
+  #       name: Average load
+  #     - entity: sensor.blackout_inverter_eh_battery_charge_time_estimate
+  #       name: Time to target
+  #     - entity: sensor.blackout_inverter_eh_outage_time_today
+  #       name: Outage time today
+  #     - entity: sensor.blackout_inverter_eh_outage_count_today
+  #       name: Outages today
+  #
+  # - type: entities
+  #   title: Automation
+  #   state_color: true
+  #   entities:
+  #     - entity: switch.blackout_inverter_automation_emergency_charge
+  #       name: Daytime rebuild
+  #     - entity: switch.blackout_inverter_automation_battery_protection
+  #       name: Battery protection
+  #     - entity: switch.blackout_inverter_full_manual_mode
+  #       name: Full manual mode
+  #     - entity: sensor.blackout_inverter_eh_charge_status
+  #       name: Status
+title: Battery Management

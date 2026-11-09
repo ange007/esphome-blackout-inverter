@@ -1,0 +1,800 @@
+binary_sensor:
+  - platform: status
+    name: "ESP Status"
+    entity_category: diagnostic
+
+
+  - platform: template
+    name: "[EH] Charging Active"
+    id: charging_active_binary
+    icon: "mdi:battery-charging"
+    lambda: |-
+      return id(charge_active);
+
+  # Mirrors the grid_present global maintained by the interval lambda. Local to the
+  # inverter, so it keeps working when the internet (and any cloud-based smart plug
+  # used as an outage detector) is down with the power.
+
+  - platform: template
+    name: "[EH] Grid Present"
+    id: grid_present_binary
+    device_class: power
+    icon: "mdi:transmission-tower"
+    lambda: |-
+      return id(grid_present);
+
+
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: "ESP IP"
+      entity_category: diagnostic
+    ssid:
+      name: "ESP SSID"
+      entity_category: diagnostic
+
+
+  - platform: debug
+    reset_reason:
+      name: "ESP Reset Reason"
+      entity_category: diagnostic
+
+  # Pairs with ESP Reset Reason: when that says "Software/System restart", this says
+  # which SELF-HEAL rule asked for it. Stays on the last reason until the next one.
+
+  - platform: template
+    name: "ESP Last Self-Restart"
+    icon: "mdi:restart-alert"
+    entity_category: diagnostic
+    update_interval: 300s
+    lambda: |-
+      switch (id(self_restart_reason)) {
+        case 1:  return std::string("API down");
+        case 2:  return std::string("WiFi down");
+        case 3:  return std::string("Modbus silent");
+        case 4:  return std::string("Nightly");
+        default: return std::string("None");
+      }
+
+
+  - platform: template
+    name: "[EH] Hourly Load Profile"
+    id: hourly_load_profile_text
+    icon: "mdi:chart-timeline-variant"
+    disabled_by_default: true
+    update_interval: 300s
+    lambda: |-
+      std::string s;
+      s.reserve(200);
+      char buf[12];
+      for (int h = 0; h < 24; h++) {
+        if (h) s += ",";
+        snprintf(buf, sizeof(buf), "%d", (int)(id(hourly_load_profile)[h] * blackout::HOURLY_LOAD_STEP_W));
+        s += buf;
+      }
+      return s;
+
+
+  - platform: template
+    name: "[EH] Charge Status"
+    icon: "mdi:information"
+    update_interval: 10s
+    lambda: |-
+      std::string status = "";
+      float soc = id(battery_state_of_charge).state;
+      float voltage = id(battery_voltage_sensor).state;
+      float current = id(active_charge_amps);
+      float target = id(target_charge_amps);
+      
+      // (int) of NaN is 2147483647 on this toolchain, which is what the status showed
+      // for the first minutes after every boot. Print dashes until the reads arrive.
+      if (id(full_manual_mode)) {
+        char buf[50];
+        if (isnan(soc) || isnan(voltage)) {
+          snprintf(buf, sizeof(buf), "🔒 MANUAL | --%% / --V");
+        } else {
+          snprintf(buf, sizeof(buf), "🔒 MANUAL | %d%% / %.1fV", (int)soc, voltage);
+        }
+        return std::string(buf);
+      }
+      
+      if (id(manual_charge_active)) {
+        status = "🔧 Manual";
+      } else if (id(charge_active)) {
+        auto t = id(homeassistant_time).now();
+        if (!t.is_valid()) {
+          status = "🔌 Charging";
+        } else if (t.hour >= ${night_start_hour} || t.hour < ${night_end_hour}) {
+          status = "🌙 Night";
+        } else if (soc < ${critical_low_soc}) {
+          status = "⛔ Critical";
+        } else if (id(energy_strategy) == 2) {
+          status = "🛡️ Top-up";
+        } else if (id(active_target_soc) > id(reserve_target_soc_sensor).state + 1.0f) {
+          // A rebuild stops at the reserve; a session aiming above it is the outage plan's.
+          status = "📋 Plan";
+        } else {
+          status = "⚠️ Rebuild";
+        }
+      } else {
+        status = "💤 Standby";
+      }
+
+      if (id(charge_active)) {
+        char buf[25];
+        if (id(ramp_up_active)) {
+          snprintf(buf, sizeof(buf), " ⬆️%d→%dA", (int)current, (int)target);
+        } else {
+          snprintf(buf, sizeof(buf), " %dA", (int)target);
+        }
+        status += std::string(buf);
+      }
+
+      status += " | ";
+      switch (id(energy_strategy)) {
+        case 0:  status += "☀️"; break;
+        case 2:  status += "🛡️"; break;
+        default: status += "🔋"; break;
+      }
+
+      {
+        float r = id(reserve_target_soc_sensor).state;
+        if (!isnan(r)) {
+          char rbuf[24];
+          snprintf(rbuf, sizeof(rbuf), " R%d%%", (int) r);
+          status += std::string(rbuf);
+        }
+      }
+
+      if (!id(grid_present)) {
+        status += " ⚡";
+      }
+
+      return status;
+
+
+
+sensor:
+  - platform: wifi_signal
+    name: "ESP WiFi"
+    update_interval: 60s
+    entity_category: diagnostic
+
+
+  - platform: uptime
+    name: "ESP Uptime"
+    entity_category: diagnostic
+
+
+  - platform: debug
+    free:
+      name: "ESP Heap Free"
+      entity_category: diagnostic
+    block:
+      name: "ESP Heap Max Block"
+      entity_category: diagnostic
+    fragmentation:
+      name: "ESP Heap Fragmentation"
+      entity_category: diagnostic
+    loop_time:
+      name: "ESP Loop Time"
+      entity_category: diagnostic
+
+
+  - platform: template
+    name: "[EH] Load Power"
+    id: true_load_power
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    icon: "mdi:home-lightning-bolt"
+    update_interval: 10s
+    lambda: |-
+      float inv  = id(inverter_power_sensor).state;
+      float grid = id(grid_power_sensor).state;
+      if (isnan(inv) || isnan(grid)) return NAN;
+
+      float grid_import = grid < 0.0f ? -grid : 0.0f;
+      float l = inv + grid_import;
+
+      float direct = id(load_power_sensor).state;
+      if (!isnan(direct) && direct > l) l = direct;
+
+      return l > 0.0f ? l : 0.0f;
+
+  # NET battery power (signed) — single physically-grounded battery flow.
+  # reg 25273/25274 (Battery power/current, disabled above) are charger-side throughput,
+  # unreliable. Estimate by DC balance using the calibrated true_load:
+  #   Battery_DC = (true_load − grid_import) / η_inv − PV       [>0 discharge]
+  # Whatever the grid supplies beyond the house load is going into the battery:
+  #   • grid idle       → load / η − pv          discharging to cover the house
+  #   • grid charging   → (155 − 1266) / η       ≈ 1.17 kW into the battery
+  #   • bypass          → (368 − 368) / η = 0    battery neither charging nor draining
+  # grid_import uses the measured sign convention (negative = import); see [EH] Load
+  # Power above. With the old inverted sign this term was always 0, which is why
+  # [EH] Daily Battery Charge Energy read 0.0 kWh after a full night of grid charging.
+  #   >0 = net charging, <0 = net discharging
+
+  - platform: template
+    name: "[EH] Battery Net Power"
+    id: battery_net_power
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    icon: "mdi:battery-sync"
+    update_interval: 10s
+    lambda: |-
+      float load = id(true_load_power).state;
+      float grid = id(grid_power_sensor).state;
+      float pv   = id(bi_pv_power).state;
+      if (isnan(load) || isnan(grid) || isnan(pv)) return NAN;
+      float grid_import = grid < 0.0f ? -grid : 0.0f;       // negative grid = import
+      const float eff = (float)(${inverter_efficiency});
+      float net_discharge = (load - grid_import) / eff - pv;  // >0 discharge
+      return -net_discharge;  // >0 net charging, <0 net discharging
+
+  # Net charge / discharge split — mutually exclusive, feed the daily energy integrators.
+
+  - platform: template
+    name: "[EH] Battery Net Charge Power"
+    id: battery_net_charge_power
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 10s
+    lambda: |-
+      float n = id(battery_net_power).state;
+      return (!isnan(n) && n > 0.0f) ? n : 0.0f;
+
+
+  - platform: template
+    name: "[EH] Battery Net Discharge Power"
+    id: battery_net_discharge_power
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 10s
+    lambda: |-
+      float n = id(battery_net_power).state;
+      return (!isnan(n) && n < 0.0f) ? -n : 0.0f;
+
+  # Smoothed house load. The instantaneous figure swings with every kettle.
+  # Time constant ~1h at the 30s update rate (alpha ≈ 30 / 3600). Feeds the autonomy
+  # estimate ("how long at what the house draws now"); the reserve uses the profile and
+  # the day average instead, so it does not chase whatever was switched on last.
+  #
+  # Implausible readings are skipped rather than averaged in. An hour of bypass used to
+  # feed zeros into this filter, and because the reserve is derived from it, the reserve
+  # decayed toward its floor exactly while the battery was being protected — the reading
+  # that says "you need less reserve" was caused by the reserve logic itself.
+
+  - platform: template
+    name: "[EH] Average Load Power"
+    id: average_load_power
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    icon: "mdi:chart-bell-curve"
+    update_interval: 30s
+    accuracy_decimals: 0
+    lambda: |-
+      float w = id(true_load_power).state;
+      if (isnan(w) || w < ${min_valid_load_w}) return {};  // hold, do not publish
+      return w;
+    filters:
+      - exponential_moving_average:
+          alpha: 0.0083
+          send_every: 1
+
+  # DIAGNOSTIC ONLY — deliberately not wired into the reserve or the autonomy estimate.
+  #
+  # Reads the inverter's "Battery stop discharging voltage" through the LiFePO4 curve to
+  # show roughly where it would give up. Useful as a sanity check on a misconfigured
+  # cut-off, and nothing more, because the inversion is not trustworthy:
+  #
+  #   measured on this pack, SoC 30% -> 52.5 V ... SoC 95% -> 53.4 V
+  #
+  # Two thirds of the capacity inside nine tenths of a volt. A 0.1 V reading error moves
+  # the answer by tens of percent, and the generic curve is out by up to 2.8 V at high
+  # SoC on this pack anyway. An earlier version fed this into the reserve and inflated it
+  # by ten points on the strength of that arithmetic.
+  #
+  # The floor that IS used is critical_low_soc, set from observed behaviour: ten days of
+  # history bottom out at 24% SoC / 51.2 V, so ${critical_low_soc}% is about right.
+
+  - platform: template
+    name: "[EH] Usable Floor SoC (est)"
+    id: usable_floor_soc
+    unit_of_measurement: "%"
+    device_class: battery
+    icon: "mdi:battery-off-outline"
+    entity_category: diagnostic
+    disabled_by_default: true
+    update_interval: 300s
+    accuracy_decimals: 0
+    lambda: |-
+      float cutoff_v = blackout::soc_to_voltage(id(bi_ctl_discharge_stop_soc).state, ${battery_cells_s});
+      if (isnan(cutoff_v)) return {};
+      return blackout::voltage_to_soc(cutoff_v, ${battery_cells_s});
+
+  # Same signal over a whole day rather than an hour. alpha = 30s / 24h.
+  #
+  # The hourly one answers "what is the house drawing now" — the autonomy estimate.
+  # This one answers "what does a day here cost", which is what both the daily-load
+  # estimate and the reserve's unlearned hours need: an evening EMA of 420 W times 24
+  # gives 10.1 kWh, while the inverter's own counters put real days at about 7.1.
+
+  - platform: template
+    name: "[EH] Daily Average Load"
+    id: daily_average_load
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    icon: "mdi:chart-histogram"
+    entity_category: diagnostic
+    update_interval: 30s
+    accuracy_decimals: 0
+    lambda: |-
+      // alpha = 30s / 24h. Hand-rolled rather than an ESPHome filter so the state can be
+      // seeded from flash — see blackout::ema_step.
+      // First boot with this code: nothing saved yet. Seed from the learned profile's
+      // mean rather than the first sample — booting while a heater runs would otherwise
+      // start the "daily" average at 1 kW and hold the reserve high for a day.
+      if (isnan(id(daily_load_ema)) && id(daily_load_saved_w) == 0) {
+        float sum = 0.0f;
+        int n = 0;
+        for (uint8_t v : id(hourly_load_profile)) {
+          if (v > 0) { sum += v * blackout::HOURLY_LOAD_STEP_W; n++; }
+        }
+        if (n >= 6) id(daily_load_saved_w) = (uint16_t) (sum / n + 0.5f);
+      }
+      float w = id(true_load_power).state;
+      if (isnan(w) || w < ${min_valid_load_w}) {
+        if (isnan(id(daily_load_ema)) && id(daily_load_saved_w) > 0)
+          return (float) id(daily_load_saved_w);
+        return {};
+      }
+      return blackout::ema_step(id(daily_load_ema), id(daily_load_saved_w), w, 0.00035f, 20.0f);
+
+  # The number the daytime logic hangs off: the SoC that still delivers the autonomy
+  # target if the power went out RIGHT NOW. Rises ahead of the evening peak, falls
+  # overnight. Drives the hold band and the daytime rebuild.
+
+  - platform: template
+    name: "[EH] Reserve Target SoC"
+    id: reserve_target_soc_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    icon: "mdi:battery-heart-variant"
+    update_interval: 30s
+    accuracy_decimals: 0
+    lambda: |-
+      if (id(energy_strategy) == 2) return ${backup_target_soc};
+
+      auto t = id(homeassistant_time).now();
+      int h = t.is_valid() ? t.hour : 0;
+      float hours = blackout::effective_reserve_hours(
+          id(reserve_hours_number).state,
+          blackout::override_age_ms(id(reserve_hours_set_epoch),
+              id(homeassistant_time).now().is_valid() ? (uint32_t) id(homeassistant_time).now().timestamp : 0,
+              id(reserve_hours_set_ms), millis()),
+          ${reserve_override_ttl_hours} * 3600000UL,
+          id(energy_strategy), ${reserve_hours_sun}, ${reserve_hours_reserve});
+      hours = blackout::ha_absent_hours(hours, id(ha_absent_worst),
+                                            id(energy_strategy), ${reserve_hours_worst_case});
+
+      // Unlearned hours of the profile are filled with the DAY average, not the last
+      // hour's. The reserve insures against an outage lasting hours; sizing it off the
+      // hourly average made it chase every appliance — a heater switched on at 06:00
+      // took it from ~57% to 77% within the hour and triggered a day-tariff rebuild.
+      // A persistent change still gets in, through the profile, over a few days.
+      float fallback = id(daily_average_load).state;
+      if (isnan(fallback) || fallback <= 0.0f) fallback = id(average_load_power).state;
+      if (isnan(fallback) || fallback <= 0.0f) fallback = 300.0f;
+
+      // Bottom of the usable range. An explicit, measured knob — NOT derived from the
+      // inverter's cut-off voltage, because on a LiFePO4 pack that inversion is
+      // meaningless: this one covers 30%..95% SoC within 52.5-53.4 V. See
+      // [EH] Usable Floor SoC for the diagnostic and critical_low_soc for the rationale.
+      float floor_soc = ${critical_low_soc};
+
+      float need_ac = blackout::expected_load_wh(h, hours, id(hourly_load_profile).data(), fallback);
+      float need_dc = blackout::ac_to_dc_wh(
+          need_ac, hours, (float)(${inverter_efficiency}), (float)(${inverter_idle_w}));
+      return blackout::reserve_target_soc(
+          need_dc, id(battery_capacity_ah).state, ${battery_cells_s} * 3.2f,
+          floor_soc, ${reserve_soc_min}, ${reserve_soc_max});
+
+  # Expected consumption over a whole day, straight out of the learned hourly profile:
+  # the sum of all 24 buckets. This is what the Battery Smart Management automation uses
+  # to decide whether tomorrow's sun will cover the house, replacing a hand-entered
+  # constant that nobody revisits as the seasons change.
+  #
+  # Hours the profile has not seen yet fall back to the smoothed average, so the figure
+  # is usable immediately and simply gets more honest over the first few days. Reads
+  # high while the profile is still filling in, because the fallback is today's average
+  # rather than the quiet small hours.
+
+  - platform: template
+    name: "[EH] Expected Daily Load"
+    id: expected_daily_load
+    unit_of_measurement: "kWh"
+    device_class: energy
+    icon: "mdi:chart-box-outline"
+    update_interval: 300s
+    accuracy_decimals: 2
+    lambda: |-
+      // Day-scale average for the gaps: filling unlearned hours with the hourly EMA
+      // stamps the current moment onto all 24 of them, and at 420 W in the evening
+      // that turned a 7 kWh day into a 10 kWh one.
+      float fallback = id(daily_average_load).state;
+      if (isnan(fallback) || fallback <= 0.0f) fallback = id(average_load_power).state;
+      if (isnan(fallback) || fallback <= 0.0f) return {};
+      return blackout::expected_load_wh(
+          0, 24.0f, id(hourly_load_profile).data(), fallback) / 1000.0f;
+
+  # The same profile over the day-tariff window only (${night_end_hour}:00 to
+  # ${night_start_hour}:00). This is what the battery and the sun have to cover between
+  # night charges; the night hours are paid at the night rate whichever way they are
+  # served. The daily total runs ~30% higher, and sizing tomorrow's night bump off it
+  # bought energy that was then spent overnight rather than carried into the day.
+
+  - platform: template
+    name: "[EH] Expected Day Load"
+    id: expected_day_load
+    unit_of_measurement: "kWh"
+    device_class: energy
+    icon: "mdi:weather-sunny-alert"
+    update_interval: 300s
+    accuracy_decimals: 2
+    lambda: |-
+      float fallback = id(daily_average_load).state;
+      if (isnan(fallback) || fallback <= 0.0f) fallback = id(average_load_power).state;
+      if (isnan(fallback) || fallback <= 0.0f) return {};
+      const float hours = (float) (((${night_start_hour} - ${night_end_hour}) + 24) % 24);
+      return blackout::expected_load_wh(
+          ${night_end_hour}, hours, id(hourly_load_profile).data(), fallback) / 1000.0f;
+
+  # Same calculation against the WORST window of the day instead of the next one.
+  # This is what night charging aims at: with a two-zone meter the evening peak has to
+  # be bought at the night rate, and the night-time reserve is far too small to say so.
+
+  - platform: template
+    name: "[EH] Reserve Peak SoC"
+    id: reserve_peak_soc_sensor
+    unit_of_measurement: "%"
+    device_class: battery
+    icon: "mdi:battery-alert-variant-outline"
+    entity_category: diagnostic
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      if (id(energy_strategy) == 2) return ${backup_target_soc};
+
+      // Larger of the schedule override and the strategy preset — see
+      // blackout::night_reserve_hours. Only night charging aims at this figure, so
+      // the extra hours are bought at the night rate and never by a daytime rebuild.
+      float hours = blackout::night_reserve_hours(
+          id(reserve_hours_number).state,
+          blackout::override_age_ms(id(reserve_hours_set_epoch),
+              id(homeassistant_time).now().is_valid() ? (uint32_t) id(homeassistant_time).now().timestamp : 0,
+              id(reserve_hours_set_ms), millis()),
+          ${reserve_override_ttl_hours} * 3600000UL,
+          id(energy_strategy), ${reserve_hours_sun}, ${reserve_hours_reserve});
+      hours = blackout::ha_absent_hours(hours, id(ha_absent_worst),
+                                            id(energy_strategy), ${reserve_hours_worst_case});
+
+      // Unlearned hours of the profile are filled with the DAY average, not the last
+      // hour's. The reserve insures against an outage lasting hours; sizing it off the
+      // hourly average made it chase every appliance — a heater switched on at 06:00
+      // took it from ~57% to 77% within the hour and triggered a day-tariff rebuild.
+      // A persistent change still gets in, through the profile, over a few days.
+      float fallback = id(daily_average_load).state;
+      if (isnan(fallback) || fallback <= 0.0f) fallback = id(average_load_power).state;
+      if (isnan(fallback) || fallback <= 0.0f) fallback = 300.0f;
+
+      // Bottom of the usable range. An explicit, measured knob — NOT derived from the
+      // inverter's cut-off voltage, because on a LiFePO4 pack that inversion is
+      // meaningless: this one covers 30%..95% SoC within 52.5-53.4 V. See
+      // [EH] Usable Floor SoC for the diagnostic and critical_low_soc for the rationale.
+      float floor_soc = ${critical_low_soc};
+
+      float need_ac = blackout::peak_load_wh(hours, id(hourly_load_profile).data(), fallback);
+      float need_dc = blackout::ac_to_dc_wh(
+          need_ac, hours, (float)(${inverter_efficiency}), (float)(${inverter_idle_w}));
+      return blackout::reserve_target_soc(
+          need_dc, id(battery_capacity_ah).state, ${battery_cells_s} * 3.2f,
+          floor_soc, ${reserve_soc_min}, ${reserve_soc_max});
+
+
+  - platform: template
+    name: "[EH] Outage Time Today"
+    id: outage_time_today
+    unit_of_measurement: "h"
+    device_class: duration
+    icon: "mdi:transmission-tower-off"
+    update_interval: 60s
+    accuracy_decimals: 1
+    lambda: |-
+      unsigned long s = id(outage_seconds_today);
+      // Include the outage currently in progress so the figure doesn't jump at the end.
+      if (!id(grid_present) && id(grid_lost_ms) != 0) {
+        s += (millis() - id(grid_lost_ms)) / 1000UL;
+      }
+      return s / 3600.0f;
+
+
+  - platform: template
+    name: "[EH] Outage Count Today"
+    id: outage_count_today_sensor
+    icon: "mdi:counter"
+    state_class: total_increasing
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      return (float) id(outage_count_today);
+
+
+  - platform: template
+    # Worst-case backup autonomy: how long the battery alone sustains the current AC
+    # load if grid/PV vanished now (blackout readiness). Always shows a figure, even
+    # when grid/PV currently serve the load and the battery isn't actually draining.
+    name: "[EH] Battery Backup Autonomy"
+    id: battery_runtime_hours
+    unit_of_measurement: "h"
+    device_class: duration
+    icon: "mdi:timer-outline"
+    update_interval: 30s
+    accuracy_decimals: 1
+    lambda: |-
+      float soc = id(battery_state_of_charge).state;
+      float capacity_ah = id(battery_capacity_ah).state;
+      float voltage_v = ${battery_cells_s} * 3.2f;  // LiFePO4 nominal: 3.2V/cell
+      const float efficiency = (float)(${inverter_efficiency});
+
+      // Averaged load, not the instantaneous one. Dividing stored energy by a momentary
+      // reading is what produced the 170-hour spikes in this sensor's history: any dip
+      // toward zero sends the quotient to the moon, and a bypass reading of exactly zero
+      // used to come out as a flat, alarming "0 h".
+      float load = id(average_load_power).state;
+      if (isnan(load) || load < ${min_valid_load_w}) load = id(true_load_power).state;
+      if (isnan(load) || load < ${min_valid_load_w}) return {};  // hold the last figure
+
+      if (isnan(soc) || capacity_ah <= 0) return {};
+
+      // Only energy above the usable floor is deliverable (BMS/critical cutoff).
+      float usable_floor = ${critical_low_soc};
+      if (soc <= usable_floor) return 0.0f;
+
+      // DC energy on hand, against the rate the battery actually gives it up:
+      // the AC load grossed up for conversion loss, plus the inverter's own idle draw.
+      float available_dc_wh = capacity_ah * voltage_v * ((soc - usable_floor) / 100.0f);
+      const float idle_w = (float)(${inverter_idle_w});
+      float dc_drain_w = load / efficiency + idle_w;
+      float runtime_hours = available_dc_wh / dc_drain_w;
+
+      if (runtime_hours < 0.0f) return 0.0f;
+      return runtime_hours > 99.0f ? 99.0f : runtime_hours;
+
+
+  - platform: template
+    name: "[EH] Battery Charge Time Estimate"
+    id: battery_charge_time_hours
+    unit_of_measurement: "h"
+    device_class: duration
+    icon: "mdi:battery-charging-outline"
+    update_interval: 30s
+    accuracy_decimals: 1
+    lambda: |-
+      // Time to reach the charge target at the CURRENT net charge power into the battery.
+      // Uses battery_net_charge_power (DC balance) → counts ALL sources: solar-only,
+      // grid-only, or solar+grid simultaneously, and works even with no automation
+      // session active (passive solar charging).
+      float soc = id(battery_state_of_charge).state;
+      float capacity_ah = id(battery_capacity_ah).state;
+      float voltage_v = ${battery_cells_s} * 3.2f;  // LiFePO4 nominal: 3.2V/cell
+      if (isnan(soc) || capacity_ah <= 0) return 0.0;
+
+      // Target SoC: a running session knows its own target; otherwise the battery is
+      // just soaking up surplus PV → aim for full.
+      float stop_soc = id(charge_active) ? id(active_target_soc) : 100.0f;
+      if (soc >= stop_soc) return 0.0;
+
+      // Net DC power into the battery from all sources (>0 only when actually charging).
+      float charge_w = id(battery_net_charge_power).state;
+      if (isnan(charge_w) || charge_w <= 0.0f) return 0.0;
+
+      // DC Wh still needed to reach the target SoC.
+      float needed_wh = capacity_ah * voltage_v * (stop_soc - soc) / 100.0f;
+      float hours = needed_wh / charge_w;
+      return (hours > 99) ? 0.0 : hours;
+
+
+  - platform: template
+    name: "[EH] Active Charge Amps"
+    unit_of_measurement: "A"
+    device_class: current
+    entity_category: diagnostic
+    icon: "mdi:current-ac"
+    update_interval: 10s
+    lambda: |-
+      if (id(charge_active)) {
+        if (id(ramp_up_active)) {
+          return id(active_charge_amps);
+        } else {
+          return id(target_charge_amps);
+        }
+      }
+      return id(bi_ctl_grid_charge_amps).state;
+
+
+  - platform: template
+    name: "[EH] Active Charge Limit (%)"
+    id: auto_active_charge_limit
+    unit_of_measurement: "%"
+    icon: "mdi:battery-arrow-up"
+    entity_category: diagnostic
+    update_interval: 30s
+    accuracy_decimals: 0
+    lambda: |-
+      // Where the current (or next) charge session stops. Night charging aims at the
+      // peak reserve, so mirror that here rather than the current one.
+      if (id(charge_active)) return id(active_target_soc);
+      if (id(energy_strategy) == 2) return ${backup_target_soc};
+      // night_target_soc() of the interval's last cycle: one computation, not three copies.
+      float t = id(night_target_now);
+      return isnan(t) ? ${reserve_soc_min} : t;
+
+
+  - platform: template
+    name: "[EH] Active Discharge Limit (%)"
+    id: auto_active_discharge_limit
+    unit_of_measurement: "%"
+    icon: "mdi:battery-arrow-down"
+    entity_category: diagnostic
+    update_interval: 30s
+    accuracy_decimals: 0
+    lambda: |-
+      // Where the battery stops being used freely: the reserve during the day (the
+      // soft-hold band starts here), the night restart threshold after dark.
+      if (id(energy_strategy) == 2) return ${backup_target_soc};
+
+      float r = id(reserve_target_soc_sensor).state;
+      if (isnan(r)) return ${reserve_soc_min};
+
+      auto t = id(homeassistant_time).now();
+      bool is_day = t.is_valid() && !(t.hour >= ${night_start_hour} || t.hour < ${night_end_hour});
+      if (is_day) return r;
+
+      float night_target = id(night_target_now);
+      if (isnan(night_target)) return r;
+      return night_target - ${reserve_restart_hysteresis};
+
+  # Grid draw as a positive number, for the daily "buy" integrator.
+  # grid_power_sensor is S_WORD and NEGATIVE while importing (see [EH] Load Power for the
+  # measurements). This used to clamp the wrong way round, so it reported ~0 permanently:
+  # a day that included charging the pack from 86% to 99% off the grid overnight came out
+  # as 0.0004 kWh bought.
+
+  - platform: template
+    name: "[EH] Grid Import Power"
+    id: grid_import_power
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      float g = id(grid_power_sensor).state;
+      if (isnan(g)) return NAN;
+      return g < 0.0f ? -g : 0.0f;
+
+  # ============================================================
+  # DAILY ENERGY - resets at midnight
+  # ============================================================
+
+  # Single MPPT (PV18/PH18 family has one PV input → only PV1 registers 15205-15208).
+  # Multi-MPPT MUST models: add a pv2_power_sensor (its own register) and sum both into
+  # a template power sensor, then point power_id here at that sum.
+
+  - platform: total_daily_energy
+    restore: false  # HA keeps the totals; saving them erased the flash every 5 min
+    id: daily_solar_energy
+    name: "[EH] Daily Solar Energy"
+    power_id: bi_pv_power
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    state_class: total_increasing
+    device_class: energy
+    filters:
+      - multiply: 0.001
+
+
+  - platform: total_daily_energy
+    restore: false  # HA keeps the totals; saving them erased the flash every 5 min
+    id: daily_load_energy
+    name: "[EH] Daily Load Energy"
+    power_id: true_load_power   # calibrated load (inverter_power-based), not the under-reading reg
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    state_class: total_increasing
+    device_class: energy
+    filters:
+      - multiply: 0.001
+
+
+  - platform: total_daily_energy
+    restore: false  # HA keeps the totals; saving them erased the flash every 5 min
+    id: daily_grid_buy_energy
+    name: "[EH] Daily Grid Buy Energy"
+    power_id: grid_import_power
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    state_class: total_increasing
+    device_class: energy
+    filters:
+      - multiply: 0.001
+
+
+  - platform: total_daily_energy
+    restore: false  # HA keeps the totals; saving them erased the flash every 5 min
+    id: daily_battery_charge_energy
+    name: "[EH] Daily Battery Charge Energy"
+    # Net charge only (charger-side reg 25273 overcounts PV passthrough as charge).
+    power_id: battery_net_charge_power
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    state_class: total_increasing
+    device_class: energy
+    filters:
+      - multiply: 0.001
+
+
+  - platform: total_daily_energy
+    restore: false  # HA keeps the totals; saving them erased the flash every 5 min
+    id: daily_battery_discharge_energy
+    name: "[EH] Daily Battery Discharge Energy"
+    # Net discharge only. reg 25273/25274 are charger-side throughput: they underreport
+    # discharge (miss the inverter's direct DC draw — night balance 108W reg vs 242W
+    # actual) and overreport charge (PV passthrough). The net DC-balance split avoids
+    # double-counting when charger and inverter run at once.
+    # NOTE for other MUST models: if YOUR reg 25273 reports true battery-terminal power
+    # (verify at night: Battery power ≈ Load/0.9 with no PV/grid), you may instead feed the
+    # daily energies from `battery_charge_power` / `battery_discharge_power` directly.
+    power_id: battery_net_discharge_power
+    unit_of_measurement: "kWh"
+    accuracy_decimals: 2
+    state_class: total_increasing
+    device_class: energy
+    filters:
+      - multiply: 0.001
+
+
+time:
+  - platform: homeassistant
+    id: homeassistant_time
+    timezone: ${timezone}
+
+  - platform: sntp
+    id: sntp_time
+    timezone: ${timezone}
+    servers:
+      - ua.pool.ntp.org
+      - pool.ntp.org
+      - time.cloudflare.com
+
+script:
+  - id: send_battery_event
+    mode: queued
+    max_runs: 10
+    then:
+      - homeassistant.event:
+          event: esphome.battery_notification
+          data:
+            device: ${device_name}
+            event_id: !lambda 'return id(event_id_str);'
+            title: !lambda 'return id(event_title);'
+            message: !lambda 'return id(event_message);'
+            priority: !lambda 'return id(event_priority);'
+

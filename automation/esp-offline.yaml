@@ -1,0 +1,57 @@
+# Home Assistant automation (paste into automations.yaml, or the UI's YAML editor).
+alias: ESP Offline Alert
+description: >-
+  Tells the phone when the inverter's ESP has been out of Home Assistant for 10 min, and when it
+  is back. All charging decisions run on the ESP; HA only adds information, so an ESP that
+  merely lost WiFi keeps charging. One that hung or lost power does not: the inverter keeps its
+  last registers (usually no grid charging) until someone restarts the ESP. It restarts itself
+  after 10 min without HA or 30 min without WiFi (heal_*_minutes in the firmware).
+triggers:
+  - trigger: state
+    entity_id: sensor.blackout_inverter_esp_uptime
+    to: unavailable
+    for: "00:10:00"
+    id: offline
+  - trigger: state
+    entity_id: sensor.blackout_inverter_esp_uptime
+    from: unavailable
+    id: back
+conditions: []
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: offline
+        sequence:
+          - action: notify.notify
+            data:
+              title: "📵 Inverter ESP offline"
+              message: >-
+                No contact since {{ as_local(trigger.to_state.last_changed).strftime('%H:%M') }}.
+                If it does not come back within 30 min, power-cycle the D1 mini: while it is
+                down nothing starts a grid charge.
+          - action: persistent_notification.create
+            data:
+              notification_id: esp_offline
+              title: "📵 Inverter ESP offline"
+              message: >-
+                No contact since {{ as_local(trigger.to_state.last_changed).strftime('%d.%m %H:%M') }}.
+                Power-cycle the D1 mini if it does not return on its own within 30 min.
+      - conditions:
+          - condition: trigger
+            id: back
+          - condition: template
+            # Only after a real outage of contact, not the few seconds of an OTA or reboot.
+            value_template: >-
+              {{ (now() - trigger.from_state.last_changed).total_seconds() >= 600 }}
+        sequence:
+          - action: notify.notify
+            data:
+              title: "✅ Inverter ESP back"
+              message: >-
+                Back after {{ ((now() - trigger.from_state.last_changed).total_seconds() / 60) | round(0) | int }} min.
+          - action: persistent_notification.dismiss
+            data:
+              notification_id: esp_offline
+mode: queued
+max: 4

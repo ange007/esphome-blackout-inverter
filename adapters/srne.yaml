@@ -1,0 +1,922 @@
+# SRNE adapter — UNTESTED (real register map, not yet verified live)
+# UART, Modbus controller, and all Modbus entities.
+#
+# UNTESTED adapter: do not flash until every register, scale, and write has been
+# verified against a real SRNE unit and live readings. Register numbers below are
+# the real SRNE MODBUS transport map; the open items are the well-known generic
+# documentation disagreements noted inline (battery-current sign, machine-state
+# values, charge load existence) — those are explicitly flagged below and in the
+# header of this file. Treat every write as untrusted until then.
+#
+# Transport: RS485 9600 8N1, slave 1 (255 universal-address escalation in the
+# docs; here 0x01, the inverter default). Reads/writes are capped at 32 holding
+# registers per frame by the inverter; to prevent ESPHome from auto-merging
+# distant registers into one out-of-spec span, every block below starts with
+# force_new_range: true (maps to ESPHome reuse_previous_range: false).
+#
+# Sources:
+#   [1] phinix-org/SRNE-inverters-by-modbus-rs485 — Modbus-RS485 V2.08 register
+#       map (P01 DC-Data 0x0100-0x0111, P02 InverterData 0x0200-0x0243, P05/E000
+#       battery settings, P07 0xE200-0xE221 user settings), 9600 8N1, slave 1
+#       (255 universal), max 32 registers/read, force_new_range: true.
+#   [2] syssi/esphome-smg-ii — ESPHome SRNE/SMG binary (ESPARU/DEYE style)
+#       smart meter (RS232/RS485 9600, slave 1), register types holding, Force
+#      _new_range on dense blocks, U_WORD/S_WORD value types, x0.1 voltage
+#       filters, S_WORD battery current with -0.1 flip for +charging.
+#   [3] RAR/esphome-srne-inverter (Anenji 12KW SRNE SN ANJ2602260356-100132) —
+#       live-verified register excerpt: SOC 0x0100 %, voltage 0x101 x0.1 V,
+#       current 0x102 x0.1 A signed, PV1 V/I 0x107/0x108 x0.1, PV1 power 0x109,
+#       PV2 0x10F-0x111, machine state 0x210, inverter/load 0x216-0x21F/0x222,
+#       mains-charge current 0x21E x0.1, PV charge current 0x224 x0.1, output
+#       priority 0xE204 (0 Solar / 1 Line / 2 SBU), charge priority 0xE20F (4
+#       values), max charge 0xE20A x0.1 A, mains-charge limit 0xE205 x0.1 A,
+#       SOC discharge cutoff 0xE00F, SOC charge cutoff 0xE01D, SOC switch to
+#       mains 0xE01F, switch to inverter 0xE020.
+#
+# Register table (all holding, FC03 read / FC06 write):
+#   P01 DC (mb 0x0100-0x0111, 18 regs — isolated [1][2]):
+#     0x100  256  Battery SOC             U_WORD  %    [1][2][3]
+#     0x101  257  Battery voltage         U_WORD  x0.1  V  [1][2][3]
+#     0x102  258  Battery current         S_WORD  x0.1  A  [1][2][3] SIGN: raw
+#            positive = DISCHARGING per validated NFE live map; the generic doc
+#            (phinix V2.08 text / syssi V1.96) says the opposite. The adapter
+#            flips with multiply: -0.1 so + = charging, matching the core
+#            convention. VERIFY LIVE: charge at known current and confirm sign.
+#     0x107  263  PV1 voltage               U_WORD  x0.1  V
+#     0x108  264  PV1 current               U_WORD  x0.1  A
+#     0x109  265  PV1 power                 U_WORD  W
+#     0x10A  266  PV total power            U_WORD  W
+#     0x10B  267  Charge state              U_WORD  enum (0 off, 1 quick,
+#            2 const-voltage, 4 float, 5 reserved, 6 Li activate, 8 full) [1]
+#     0x10E  270  Charge power (PV+mains)   U_WORD  W  [2][3]
+#     0x10F  271  PV2 voltage               U_WORD  x0.1  V
+#     0x110  272  PV2 current               U_WORD  x0.1  A
+#     0x111  273  PV2 power                 U_WORD  W
+#   P02 Inverter (0x210-0x224, 21 regs [1][2][3]):
+#     0x210  528  Machine state              U_WORD  enum — see STATE WARNING.
+#     0x212  530  Bus voltage                U_WORD  x0.1  V
+#     0x213  531  Grid voltage               U_WORD  x0.1  V
+#     0x214  532  Grid current A             U_WORD  x0.1  A
+#     0x215  533  Grid frequency             U_WORD  x0.01 Hz
+#     0x216  534  Inverter voltage A         U_WORD  x0.1  V
+#     0x217  535  Inverter current A         U_WORD  x0.1  A
+#     0x218  536  Inverter frequency         U_WORD  x0.01 Hz
+#     0x219  537  Load current A             U_WORD  x0.1  A  [2][3]
+#     0x21B  539  Load active power          U_WORD  W   [2][3]
+#     0x21E  542  Mains charge current      U_WORD  x0.1  A  [2][3]
+#     0x21F  543  Load ratio                 U_WORD  %
+#     0x220  544  Heatsink A (DC-DC)         S_WORD  x0.1 C
+#     0x221  545  Heatsink B (DC-AC)         S_WORD  x0.1 C
+#     0x222  546  Heatsink C (transformer)   S_WORD  x0.1 C
+#     0x224  548  PV charge current          U_WORD  x0.1  A  [2][3]
+#   Settings E (one register each, force_new_range [1][2]):
+#     0xE204 58116 Output priority   select  0 Solar / 1 Line / 2 SBU
+#     0xE205 58117 Mains charge current (mains-charge limit) number U_WORD x0.1 A
+#     0xE20A 58122 Max charge current (total solar+AC)    number U_WORD x0.1 A
+#     0xE20F 58127 Charge priority   select  0 PV priority / 1 mains priority /
+#            2 Hybrid / 3 PV only (syssi/RAR 4-value map; the phinix V2.08
+#            excerpt documents only 0/1 — confirm which table your firmware
+#            ships before trusting the OSO arm).
+#     0xE00F 57359 SOC discharge cutoff    number U_WORD % (SOC thresholds only
+#            count when BMS communication is up, per [3])
+#     0xE01D 57373 SOC charge cutoff       number U_WORD %
+#     0xE01F 57375 SOC switch to mains     number U_WORD %
+#     0xE020 57376 SOC switch to inverter  number U_WORD %
+#     0xE202/0xE203 Password (2 registers) — doc claims 0 means "no password";
+#            PriorityFlag 0x0211 surfaces whether a password was entered. The
+#            adapter does not write these; writes that read back unchanged are
+#            almost certainly password-gated — verify with the keypad value
+#            before assuming a dead register. VERIFY.
+#
+# Machine-state WARNING (0x210): the generic document and the validated NFE map
+# disagree. Generic doc [1] states 0 power-on delay / 1 standby / 2
+# initialization / 3 soft start / 4 AC power operation (mains) / 5 inverter /
+# 6 inverter-to-AC / 7 AC-to-inverter / 8 battery activation / 9 manual shutdown
+# / 10 fault (split-phase variant: 0 init / 1 standby / 2 AC / 3 inverter).
+# Validated NFE live readings instead report 2 = mains bypass, 3 = off-grid,
+# 5 = inverter powered / inverter operation. The text sensor below prints the
+# generic table but bi_grid_present also treats raw 2 as mains-present, so the
+# adapter stays correct under EITHER table at the 2/3 seam. Confirm your raw
+# value in each mode on site before trusting the text string.
+#
+# Sign + grid-charge conventions (core):
+#   +battery_current = charging (filter multiply: -0.1 on 0x102).
+#   grid_power_sensor is NEGATIVE while importing (may supply mains charge only,
+#   see below); bi_grid_power reports import-positive (clamped at 0).
+#   There is NO direct grid-power register. bi_grid_power and grid_power_sensor
+#   are derived from mains charge current 0x21E x0.1 A (grid->battery leg) times
+#   grid voltage 0x213 — documented gap. When the house is fed from the grid but
+#   not charging, grid_power_sensor reads ~0 and (EH) load rests on the direct
+#   load_power_sensor floor (0x21B); the battery-net estimate will not see the
+#   grid feed until the mains charge is non-zero. Inverter_power_sensor is
+#   inverter V x inverter I, so load = inverter + max(0, -grid) degrades to
+#   the direct floor in bypass — acceptable for an UNTESTED bring-up, do not
+#   use for efficiency accounting yet.
+#
+# Output priority collapse: SRNE has 3 output values (Solar/Line/SBU); the core's
+# Voltronic vocabulary has 4 (SBU/SUB/UTI/SOL). This adapter exposes 3 options —
+# SBU=2, SUB=1 (Line), SOL=0 — and maps the core's daytime-session UTI intent to
+# SUB/Line as well, because Line is the only grid-carries-the-house arm SRNE
+# has. SUB and UTI therefore collapse; the battery-assist difference the two
+# Voltronic modes ever described does not exist here. Documented deviation,
+# not a bug.
+#
+# Charge priority: phinix documents only 0 PV-priority / 1 AC-priority; the
+# syssi + RAR (live Anenji) maps expose 0-3 (0 PV pref / 1 mains pref / 2
+# hybrid / 3 PV only). This adapter follows the 4-value live map so OSO
+# (PV only = 3) exists as a stop-grid-charging arm. The bi_grid_charge script
+# writes SNU (hybrid = 2) for charge-allowed and OSO (3) for no-charge. If
+# your firmware only implements 0/1, the SNU write will need re-aliasing.
+#
+# bi_solar_priority: SRNE has no BLU/LBU register. The script is a stored-value
+# no-op (capability false for this class), same convention as the Deye adapter.
+#
+# bi_charge_stop / bi_discharge_stop: SRNE SOC cutoffs are native percentages
+# (0xE01D / 0xE00F), not voltages. The scripts compare and write the SoC
+# directly; bi_ctl_stop_soc / bi_ctl_discharge_stop_soc read the registers
+# straight through with no voltage_to_soc conversion.
+#
+# battery_power: derived V x I (no direct battery-power register).
+# inverter_power: derived inverter V x inverter I (no direct inverter-power reg).
+# grid power: derived mains-charge-current x grid-V (no direct grid-power reg).
+
+# The contract surface (bi_* scripts, reconcile, read-back sensors) is shared by the
+# Voltronic-family adapters; this file only declares the entities it drives.
+packages:
+  sync: !include
+    file: common/voltronic-sync.yaml
+    vars:
+      adapter_name: "SRNE"
+      cap_solar_aim: "0"
+      cap_grid_only: "0"
+      stop_by_soc: "1"
+      writes_enabled: "0"   # UNTESTED: no inverter writes until the readings are checked
+
+uart:
+  id: mod_bus
+  tx_pin: ${tx_pin}
+  rx_pin: ${rx_pin}
+  baud_rate: 9600
+  stop_bits: 1
+  parity: NONE
+  data_bits: 8
+
+
+modbus:
+  id: mod_bus_srne
+  send_wait_time: 200ms
+  flow_control_pin: ${flow_control_pin}
+
+
+modbus_controller:
+  - id: srne
+    address: 0x1
+    modbus_id: mod_bus_srne
+    setup_priority: -10
+    update_interval: ${updates}
+
+
+number:
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    id: grid_charger_amps
+    name: "Max Grid Charger current"
+    force_new_range: true
+    # Mains charge current limit (grid->battery leg) 0xE205, x0.1 A [2][3].
+    # NOT the total-charge cap (0xE20A): that caps solar+AC together, so the
+    # grid limit is what the charge session meters against.
+    unit_of_measurement: "A"
+    address: 57861  # 0xE205
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+    entity_category: config
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    id: max_charge_amps
+    name: "Max Charge Current (total)"
+    force_new_range: true
+    # Total charge current 0xE20A, x0.1 A. If this sits below the grid limit
+    # (0xE205), it caps the utility charger too; keep >= target.
+    unit_of_measurement: "A"
+    entity_category: config
+    address: 57866  # 0xE20A
+    value_type: U_WORD
+    lambda: "return x * 0.1;"
+    write_lambda: "return x * 10;"
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    id: batt_stop_dischg
+    name: "Battery stop discharging soc"
+    force_new_range: true
+    # SOC discharge cutoff 0xE00F, native %. Counts only when BMS comms up.
+    unit_of_measurement: "%"
+    entity_category: config
+    address: 57359
+    value_type: U_WORD
+    lambda: "return x;"
+    write_lambda: "return x;"
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    id: batt_stop_chg
+    name: "Battery stop charging soc"
+    force_new_range: true
+    # SOC charge cutoff 0xE01D, native %.
+    unit_of_measurement: "%"
+    entity_category: config
+    address: 57373
+    value_type: U_WORD
+    lambda: "return x;"
+    write_lambda: "return x;"
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    id: soc_switch_to_mains
+    name: "SOC switch to mains"
+    force_new_range: true
+    # SOC switch to mains 0xE01F, native %. Diagnostic; not in core contract.
+    unit_of_measurement: "%"
+    entity_category: config
+    address: 57375
+    value_type: U_WORD
+    lambda: "return x;"
+    write_lambda: "return x;"
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    id: soc_switch_to_inverter
+    name: "SOC switch to inverter"
+    force_new_range: true
+    # SOC switch to inverter 0xE020, native %. Diagnostic; not in core contract.
+    unit_of_measurement: "%"
+    entity_category: config
+    address: 57376
+    value_type: U_WORD
+    lambda: "return x;"
+    write_lambda: "return x;"
+
+
+select:
+  # This inverter has no solar-aim setting. A placeholder with the id the shared sync
+  # names (ESPHome checks every id() in a lambda, even one compiled out by
+  # cap_solar_aim: "0"); it is never written.
+  - platform: template
+    id: solar_use_aim
+    internal: true
+    options:
+      - "LBU (Load, Battery, Utility)"
+      - "BLU (Battery, Load, Utility)"
+    initial_option: "LBU (Load, Battery, Utility)"
+    optimistic: true
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    id: energy_use_mode
+    name: "Energy use mode (parameter 00)"
+    force_new_range: true
+    # Output priority 0xE204 [1][2][3].
+    address: 57860  # 0xE204
+    entity_category: config
+    optionsmap:
+      "SBU (Solar/battery/utility)": 2
+      "SUB (Solar/utility/battery)": 1
+      "SOL (Solar only)": 0
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    id: charger_source_priority
+    name: "Charger source priority (parameter 10)"
+    force_new_range: true
+    # Charge priority 0xE20F. 4-value live map (syssi/RAR): 0 PV priority,
+    # 1 mains priority, 2 Hybrid, 3 PV only. Core CSO/SNU/OSO mapped above.
+    address: 57871  # 0xE20F
+    entity_category: config
+    optionsmap:
+      "CSO (Solar first)": 0
+      "SNU (Solar and utility)": 2
+      "OSO (Solar only)": 3
+
+
+text_sensor:
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 267
+    name: "Charge State"
+    force_new_range: true
+    icon: mdi:battery-charging-50
+    register_type: holding
+    raw_encode: HEXBYTES
+    lambda: |-
+      uint16_t value = modbus::helpers::word_from_hex_str(x, 0);
+      switch (value) {
+        case 0: return std::string("Charge off");
+        case 1: return std::string("Quick charge");
+        case 2: return std::string("Const voltage charge");
+        case 4: return std::string("Float charge");
+        case 5: return std::string("Reserved");
+        case 6: return std::string("Li battery activate");
+        case 8: return std::string("Full");
+        default: return std::string("Unknown");
+      }
+      return x;
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 528
+    name: "Machine state"
+    force_new_range: true
+    # Generic-doc table [1]; validated NFE says 2 = mains bypass (not
+    # initialization) and 3 = off-grid. bi_grid_present below treats raw 2
+    # as mains-present so either table yields the right presence bit.
+    icon: mdi:power
+    register_type: holding
+    raw_encode: HEXBYTES
+    lambda: |-
+      uint16_t value = modbus::helpers::word_from_hex_str(x, 0);
+      switch (value) {
+        case 0: return std::string("Power-on delay");
+        case 1: return std::string("Standby");
+        case 2: return std::string("Mains (bypass per validated NFE)");
+        case 3: return std::string("Off-Grid");
+        case 4: return std::string("AC power operation");
+        case 5: return std::string("Inverter operation");
+        case 6: return std::string("Inverter to AC power");
+        case 7: return std::string("AC power to inverter");
+        case 8: return std::string("Battery activation");
+        case 9: return std::string("Manual shutdown");
+        case 10: return std::string("Fault");
+        default: return std::string("Other (" + std::to_string(value) + ")");
+      }
+      return x;
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 529
+    name: "Priority flag (password entered)"
+    force_new_range: true
+    # 0 = users have not entered password, 1 = user password entered,
+    # 4 = manufacturer password entered [1]. 0 == no password per doc —
+    # verify whether writes need one on your firmware before trusting them.
+    icon: mdi:key
+    register_type: holding
+    raw_encode: HEXBYTES
+    entity_category: diagnostic
+    lambda: |-
+      uint16_t value = modbus::helpers::word_from_hex_str(x, 0);
+      switch (value) {
+        case 0: return std::string("No password entered");
+        case 1: return std::string("User password entered");
+        case 4: return std::string("Manufacturer password entered");
+        default: return std::string("Unknown");
+      }
+      return x;
+
+
+sensor:
+  # P01 DC block (0x100-0x111, 18 regs; isolated, < 32 [1]).
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 256
+    id: battery_state_of_charge
+    name: "Battery State of Charge"
+    register_type: holding
+    force_new_range: true
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+    value_type: U_WORD
+    on_value:
+      - lambda: 'id(last_soc_update_ms) = millis(); id(bi_data_ms) = millis();'
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 257
+    id: battery_voltage_sensor
+    name: "Battery voltage"
+    register_type: holding
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 2
+    state_class: measurement
+    value_type: U_WORD
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 258
+    id: battery_current
+    name: "Battery current"
+    register_type: holding
+    # Raw positive = discharging (validated NFE); generic doc says opposite.
+    # Filter flips so + = charging (core convention). VERIFY LIVE.
+    unit_of_measurement: "A"
+    device_class: current
+    value_type: S_WORD
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: -0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 263
+    name: "PV1 Voltage"
+    register_type: holding
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 1
+    state_class: measurement
+    value_type: U_WORD
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 264
+    name: "PV1 Current"
+    register_type: holding
+    disabled_by_default: true
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    state_class: measurement
+    value_type: U_WORD
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 265
+    id: pv1_power_sensor
+    name: "PV1 Power"
+    register_type: holding
+    unit_of_measurement: "W"
+    device_class: power
+    value_type: U_WORD
+    accuracy_decimals: 0
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 266
+    name: "PV total power"
+    register_type: holding
+    unit_of_measurement: "W"
+    device_class: power
+    value_type: U_WORD
+    accuracy_decimals: 0
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 270
+    name: "Charge power (PV+mains)"
+    register_type: holding
+    unit_of_measurement: "W"
+    device_class: power
+    value_type: U_WORD
+    accuracy_decimals: 0
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 271
+    name: "PV2 Voltage"
+    register_type: holding
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 1
+    state_class: measurement
+    value_type: U_WORD
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 272
+    name: "PV2 Current"
+    register_type: holding
+    disabled_by_default: true
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    state_class: measurement
+    value_type: U_WORD
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 273
+    id: pv2_power_sensor
+    name: "PV2 Power"
+    register_type: holding
+    unit_of_measurement: "W"
+    device_class: power
+    value_type: U_WORD
+    accuracy_decimals: 0
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 528
+    id: machine_state_sensor
+    name: "Machine state (raw)"
+    register_type: holding
+    entity_category: diagnostic
+    value_type: U_WORD
+    # Text decode lives on the text_sensor above; this raw number drives
+    # bi_grid_present so either generic/validated table yields correct
+    # presence for the 2/3 seam.
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 530
+    name: "Bus voltage"
+    register_type: holding
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 1
+    state_class: measurement
+    value_type: U_WORD
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 531
+    id: grid_voltage_sensor
+    name: "Grid voltage"
+    register_type: holding
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 1
+    state_class: measurement
+    value_type: U_WORD
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 532
+    name: "Grid current"
+    register_type: holding
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    state_class: measurement
+    value_type: U_WORD
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 533
+    name: "Grid frequency"
+    register_type: holding
+    unit_of_measurement: "Hz"
+    device_class: frequency
+    accuracy_decimals: 2
+    state_class: measurement
+    value_type: U_WORD
+    filters:
+      - multiply: 0.01
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 534
+    id: inverter_voltage_sensor
+    name: "Inverter voltage"
+    register_type: holding
+    unit_of_measurement: "V"
+    device_class: voltage
+    accuracy_decimals: 1
+    state_class: measurement
+    value_type: U_WORD
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 535
+    id: inverter_current_sensor
+    name: "Inverter current"
+    register_type: holding
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    state_class: measurement
+    value_type: U_WORD
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 536
+    name: "Inverter frequency"
+    register_type: holding
+    unit_of_measurement: "Hz"
+    device_class: frequency
+    accuracy_decimals: 2
+    state_class: measurement
+    value_type: U_WORD
+    filters:
+      - multiply: 0.01
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 537
+    name: "Load current"
+    register_type: holding
+    unit_of_measurement: "A"
+    device_class: current
+    accuracy_decimals: 1
+    state_class: measurement
+    value_type: U_WORD
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 539
+    id: load_power_sensor
+    # Direct load measurement; kept as the (EH) load floor when inverter +
+    # grid_import under-read in bypass. Hidden in HA via disabled_by_default.
+    name: "Load power"
+    register_type: holding
+    disabled_by_default: true
+    unit_of_measurement: "W"
+    device_class: power
+    value_type: U_WORD
+    accuracy_decimals: 0
+    state_class: measurement
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 542
+    id: mains_charge_current
+    name: "Mains charge current (actual)"
+    register_type: holding
+    unit_of_measurement: "A"
+    device_class: current
+    value_type: U_WORD
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 548
+    name: "PV charge current"
+    register_type: holding
+    unit_of_measurement: "A"
+    device_class: current
+    value_type: U_WORD
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 544
+    name: "Heatsink A (DC-DC) temp"
+    register_type: holding
+    unit_of_measurement: "°C"
+    device_class: temperature
+    value_type: S_WORD
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 545
+    name: "Heatsink B (DC-AC) temp"
+    register_type: holding
+    unit_of_measurement: "°C"
+    device_class: temperature
+    value_type: S_WORD
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: modbus_controller
+    modbus_controller_id: srne
+    address: 546
+    name: "Heatsink C temp"
+    register_type: holding
+    unit_of_measurement: "°C"
+    device_class: temperature
+    value_type: S_WORD
+    accuracy_decimals: 1
+    state_class: measurement
+    filters:
+      - multiply: 0.1
+
+  - platform: template
+    id: battery_power
+    name: "Battery power"
+    # Derived V x I (+charging). No direct battery-power register.
+    disabled_by_default: true
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(battery_voltage_sensor).state;
+      float i = id(battery_current).state;
+      if (isnan(v) || isnan(i)) return NAN;
+      return v * i;
+
+  - platform: template
+    id: inverter_power_sensor
+    name: "Inverter power"
+    # Derived inverter V x inverter I. No direct inverter-power register;
+    # falls to 0 in bypass (the direct load floor covers that case).
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(inverter_voltage_sensor).state;
+      float i = id(inverter_current_sensor).state;
+      if (isnan(v) || isnan(i)) return NAN;
+      return v * i;
+
+  - platform: template
+    id: grid_power_sensor
+    name: "Grid power"
+    # NEGATIVE while importing (core convention), POSITIVE while exporting.
+    # No direct grid-power register: derived from mains charge current
+    # (grid->battery leg) x grid voltage. House feed without mains charging
+    # therefore reads ~0 — load rests on the direct floor.
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(grid_voltage_sensor).state;
+      float i = id(mains_charge_current).state;
+      if (isnan(v) || isnan(i)) return NAN;
+      return -(v * i);
+
+  # Contract readings (bi_*). Fixed ids for the core; each mirrors one SRNE
+  # entity (or a trivial derived quantity) and holds NAN while unavailable.
+  - platform: template
+    id: bi_soc
+    internal: true
+    name: "BI SoC"
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(battery_state_of_charge).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_battery_voltage
+    internal: true
+    name: "BI Battery voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 2
+    lambda: |-
+      float v = id(battery_voltage_sensor).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_battery_power
+    internal: true
+    name: "BI Battery power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(battery_power).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_grid_voltage
+    internal: true
+    name: "BI Grid voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 1
+    lambda: |-
+      float v = id(grid_voltage_sensor).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_load_power
+    internal: true
+    name: "BI Load power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(load_power_sensor).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_pv_power
+    internal: true
+    name: "BI PV power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v1 = id(pv1_power_sensor).state;
+      float v2 = id(pv2_power_sensor).state;
+      if (isnan(v1) && isnan(v2)) return NAN;
+      if (isnan(v1)) v1 = 0.0f;
+      if (isnan(v2)) v2 = 0.0f;
+      return v1 + v2;
+
+  - platform: template
+    id: bi_grid_power
+    internal: true
+    name: "BI Grid power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      // Import-positive: mains-charge-current x grid-V, clamped at 0.
+      float v = id(grid_voltage_sensor).state;
+      float i = id(mains_charge_current).state;
+      if (isnan(v) || isnan(i)) return NAN;
+      float p = v * i;
+      return p < 0.0f ? 0.0f : p;
+
+  - platform: template
+    id: bi_battery_current
+    internal: true
+    name: "BI Battery current"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 1
+    lambda: |-
+      float v = id(battery_current).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_grid_present
+    internal: true
+    name: "BI Grid present"
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(grid_voltage_sensor).state;
+      if (!isnan(v) && v > 150.0f) return 1.0f;
+      float s = id(machine_state_sensor).state;
+      // Raw 2 = mains bypass (validated NFE) / mains operation (generic),
+      // 4 = AC power operation, 6 = inverter-to-AC, 7 = AC-to-inverter.
+      if (s == 2.0f || s == 4.0f || s == 6.0f || s == 7.0f) return 1.0f;
+      if (!isnan(v)) return 0.0f;
+      return NAN;
+
+  - platform: template
+    id: bi_charger_state
+    internal: true
+    name: "BI Charger state"
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float i = id(battery_current).state;
+      float soc = id(battery_state_of_charge).state;
+      float stop = id(batt_stop_chg).state;
+      if (isnan(i) || isnan(soc)) return NAN;
+      if (!isnan(stop) && soc >= stop - 2.0f && i < 2.0f) return 2.0f;
+      return i > 0.5f ? 1.0f : 0.0f;

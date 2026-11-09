@@ -1,0 +1,23 @@
+# ESPHome secrets - never commit these
+secrets.yaml
+
+# ESPHome build artifacts
+.esphome/
+
+# IDE files
+.idea/
+*.iml
+
+# Local scratch: one-off analysis and deploy scripts that talk to the live Home
+# Assistant, their output, anything not meant to ship. See AGENTS.md.
+.scratch/
+
+# Playwright MCP session logs
+.playwright-mcp/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Local agent settings
+.claude/

@@ -1,0 +1,797 @@
+# PowMr SPF adapter — UNTESTED
+# UART, Modbus controller, and all Modbus entities.
+#
+# UNTESTED adapter: do not flash until the register map and readings are
+# verified on a real unit.
+#
+# REAL PowMr register map (NOT the Voltronic/MUST PI30 map used by the previous
+# version of this file).
+#
+# Transport: RS232 Modbus RTU (through an RS232<->TTL level converter; the
+# inverter port is RS232, not TTL — 3.3 V TX/RX straight into it will not work,
+# and 5 V tolerant RS232 is not quiet either), 2400 baud 8N1, slave id 5.
+# Source: leodesigner/powmr_comm ("RS232 modbus protocol at 2400 baud (1 stop
+# bit, no parity control). PowMr device slave id is 5"), confirmed by
+# odya/esphome-powmr-hybrid-inverter src/modules/inverter.yaml (uart 2400,
+# modbus_controller address 0x05).
+#
+# Read registers (holding, FC03), per odya registers-map.md
+# (https://github.com/odya/esphome-powmr-hybrid-inverter/blob/main/docs/registers-map.md):
+#   4501 Output Source Priority (index w/ offset; map prefers 4537)
+#   4502 AC Voltage      4503 AC Frequency    4504 PV Voltage
+#   4505 PV Power (W live: odya inverter.yaml reads this as "PV Power" in W;
+#        registers-map.md calls it "Charging"; leodesigner note says it may be
+#        the onboard charger state on some units — verify live before trusting
+#        bi_pv_power; see "PV power" below)
+#   4506 Battery Voltage  4507 Battery SoC    4508 Battery Charge Current
+#   4509 Battery Discharge Current            4510 Load Voltage
+#   4511 Load Frequency   4512 Load Power (W) 4513 Load VA
+#   4514 Load Percent                       4516 Binary flags (0x100 overload?)
+#   4530 Error Code                         4535 Settings binary flags
+#   4536 Charger Source Priority (read-back index, 0-3)
+#   4537 Output Source Priority (read-back index, 0-2; the "more correct" one)
+#   4538 AC Input Voltage Range             4540 Target Output Frequency
+#   4541 Max Total Charging Current         4542 Target Output Voltage
+#   4543 Max Utility Charging Current       4544 Back To Utility Source Voltage
+#   4545 Back To Battery Source Voltage     4546 Bulk Charging Voltage
+#   4547 Floating Charging Voltage          4548 Low CutOff Voltage
+#   4549-4552 Equalization settings         4553/4554 Binary flags
+#   4555 Charger Status (0 Off, 1 Idle, 2 Active)   4557 Temperature
+#
+# Write registers (per odya registers-map.md / leodesigner; "+" = tested on
+# HVM2.4H by odya, the rest unverified):
+#   5017 Charger Source Priority (0-3, menu 16) +
+#   5018 Output Source Priority (0-2, menu 1) +
+#   5022 Max Total Charge Current (10-80 A, menu 2) +
+#   5024 Utility Charge Current (one of 2/10/20/30/40/50/60 A, menu 11) +
+#   5027 Bulk charging voltage (menu 26, UNTESTED)
+#   5028 Floating charging voltage (menu 27, UNTESTED)
+#   5029 Low DC cut-off voltage (menu 29, UNTESTED)
+#   5025/5026 Comeback Utility/Battery Mode Voltage, menu 12/13 (UNTESTED)
+#
+# BYTE ORDER (verify live first!): PowMr returns words little-endian inside a
+# Modbus frame, "which doesn't have a native support in ESPHome, so we need a
+# custom function to swap bytes" (odya README). Every read below applies the
+# swap inline: `((uint16_t)x << 8 | (uint16_t)x >> 8)`. Writes in odya's
+# config carry NO swap (selects/amps at 5017/5018/5022/5024 are marked tested),
+# so this adapter follows odya literally: reads swapped, writes raw. If a
+# write is accepted but the read-back then looks swapped/garbage, writes need
+# the swap too — odya issue #48 reports selects silently reverting to
+# "utility first", a symptom consistent with wrong write byte order.
+#
+# SCALING (per odya inverter.yaml; voltages/frequencies are x0.1, everything
+# else raw): AC/PV/battery/load voltage and AC/load frequency x0.1, current
+# registers raw amps, SoC raw %, PV/load power raw W, priority/status raw idx.
+#
+# OPTION STRINGS (verbatim from odya inverter.yaml text_sensor maps):
+#   4536/5017 Charger Source Priority: 0 "Utility first", 1 "Solar first",
+#     2 "Solar and Utility", 3 "Only solar".
+#   4537/5018 Output Source Priority: 0 "Utility first (USB)",
+#     1 "Solar first (SUB)", 2 "SBU priority".
+# The core's Voltronic names are kept as the entity strings so core logic is
+# unchanged and mapped by value:
+#   energy_use_mode: SBU=2, SUB=1, UTI=0(USB).
+#     UNVERIFIED: whether 0 ("Utility first (USB)") really behaves like the
+#     core's UTI (utility-only). If live testing shows otherwise, this select
+#     is the one-line fix.
+#   charger_source_priority: CSO (Solar first)=1, SNU (Solar and utility)=2,
+#     OSO (Solar only)=3. Register value 0 ("Utility first") is not exposed.
+#
+# CONTRACT MAPPING (core bi_* ids preserved):
+#   energy_use_mode            -> 5018 write / 4537 text-sensor read-back
+#   charger_source_priority    -> 5017 write / 4536 text-sensor read-back
+#   grid_charger_amps          -> 5024 Utility Charge Current. STEPPED values
+#                                 only: {2, 10, 20, 30, 40, 50, 60}. The bi_*
+#                                 scripts quantize any requested amps to the
+#                                 nearest allowed value (ties round up) before
+#                                 writing — 5 A becomes 2 or 10 A, there is no
+#                                 true "off" here: amps=0 means priority OSO
+#                                 (solar only) and the register sits at 2 A.
+#   batt_stop_chg              -> 5027 Bulk voltage; batt_float_voltage -> 5028
+#                                 Float; batt_stop_dischg -> 5029 Low CutOff.
+#                                 batt_absorb_voltage ALSO points at 5027: PowMr
+#                                 has a single Bulk register, so the two entity
+#                                 ids mirror one hardware setting (core only
+#                                 ever writes batt_stop_chg).
+#   batt_low_voltage           -> 5025 Comeback Utility Mode Voltage
+#   batt_high_voltage          -> 5026 Comeback Battery Mode Voltage
+#   (both UNTESTED, user-facing diagnostics; not in the core contract)
+#   bi_soc <- 4507, bi_battery_voltage <- 4506, battery current/power derived
+#   from 4508/4509 and battery voltage (both current registers are positive
+#   magnitudes; current = charge - discharge, + = charging).
+#   bi_pv_power <- 4505 only. The map has ONE MPPT (no PV2 register anywhere),
+#   so there is no pv2_power_sensor: for a dual-MPPT unit this number is still
+#   the total in odya's ESPHome map (register 4505) — verify on a dual unit.
+#   grid_power_sensor/inverter_power_sensor: the PowMr map has NO grid input
+#   power register. Both mirror 4512 Load Power (W) so the core's
+#   [EH] Load Power (inverse + grid import) keeps computing load = load power.
+#   During grid charging the battery-net estimate will not see the grid feed
+#   until load is subtracted from something real — acceptable for UNTESTED.
+#   solar_use_aim: NO PowMr equivalent (LBU/BLU have no register). The select
+#   is dropped; bi_solar_priority stores its target and does nothing, because
+#   PowMr's charger-source priority (5017) already expresses solar preference.
+#   Charger/inverter alarm decoding from the MUST adapter is dropped: the map
+#   exposes only one Error Code register (4530) plus flags (4516/4553/4554),
+#   shown raw as diagnostics.
+#   Energy counters (MWh/kWh energy registers on MUST) do not exist in the
+#   PowMr map; dropped. Daily energies in core come from total_daily_energy
+#   integrators instead.
+#
+# Grid charging is IMPLEMENTED (odya write registers 5017/5018/5022/5024 are
+# tested on HVM2.4H) but stays UNTESTED on this unit: byte order, the UTI=USB
+# mapping and the "+ = charging" current signs must be checked live before
+# relying on it.
+
+# The contract surface (bi_* scripts, reconcile, read-back sensors) is shared by the
+# Voltronic-family adapters; this file only declares the entities it drives.
+packages:
+  sync: !include
+    file: common/voltronic-sync.yaml
+    vars:
+      adapter_name: "PowMr SPF"
+      cap_solar_aim: "0"
+      cap_grid_only: "0"
+      stop_by_soc: "0"
+      writes_enabled: "0"   # UNTESTED: no inverter writes until the readings are checked
+
+uart:
+  id: mod_bus
+  tx_pin: ${tx_pin}
+  rx_pin: ${rx_pin}
+  baud_rate: 2400
+  stop_bits: 1
+  parity: NONE
+  data_bits: 8
+
+
+modbus:
+  id: mod_bus_powmr
+  send_wait_time: 350ms
+  flow_control_pin: ${flow_control_pin}
+
+
+modbus_controller:
+  - id: powmr
+    address: 0x5
+    modbus_id: mod_bus_powmr
+    setup_priority: -10
+    update_interval: ${updates}
+
+
+number:
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    id: grid_charger_amps
+    name: "Max Grid Charger current"
+    unit_of_measurement: "A"
+    address: 5024
+    value_type: U_WORD
+    # STEPPED register: only 2/10/20/30/40/50/60 accepted (menu 11). min/max
+    # keep the entity honest; the bi_* scripts quantize requests to the set.
+    min_value: 2
+    max_value: 60
+    step: 1
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8);
+    write_lambda: "return x;"
+    entity_category: config
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    id: batt_float_voltage
+    name: "Float voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 5028
+    value_type: U_WORD
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8) * 0.1;
+    write_lambda: "return x * 10;"
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    id: batt_absorb_voltage
+    name: "Absorb voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    # Same hardware register as batt_stop_chg (5027 Bulk): PowMr has no
+    # separate absorb/bulk pair. Shown for parity with the MUST adapter.
+    address: 5027
+    value_type: U_WORD
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8) * 0.1;
+    write_lambda: "return x * 10;"
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    name: "Max Combine Charger current"
+    unit_of_measurement: "A"
+    entity_category: config
+    address: 5022
+    value_type: U_WORD
+    min_value: 10
+    max_value: 80
+    step: 1
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8);
+    write_lambda: "return x;"
+
+  # ============ BMS PROTECTION PARAMETERS ============
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    id: batt_stop_dischg
+    name: "Battery stop discharging voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 5029
+    value_type: U_WORD
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8) * 0.1;
+    write_lambda: "return x * 10;"
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    id: batt_stop_chg
+    name: "Battery stop charging voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 5027
+    value_type: U_WORD
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8) * 0.1;
+    write_lambda: "return x * 10;"
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    id: batt_low_voltage
+    name: "Battery low voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    # PowMr has no low/high-voltage pair; these expose the SBU comeback
+    # voltages (menu 12/13) instead: the voltage the inverter returns to
+    # utility (SBU) and battery modes at. UNTESTED writes, diagnostics only.
+    address: 5025
+    value_type: U_WORD
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8) * 0.1;
+    write_lambda: "return x * 10;"
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    id: batt_high_voltage
+    name: "Battery high voltage"
+    unit_of_measurement: "V"
+    entity_category: config
+    address: 5026
+    value_type: U_WORD
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8) * 0.1;
+    write_lambda: "return x * 10;"
+
+
+select:
+  # This inverter has no solar-aim setting. A placeholder with the id the shared sync
+  # names (ESPHome checks every id() in a lambda, even one compiled out by
+  # cap_solar_aim: "0"); it is never written.
+  - platform: template
+    id: solar_use_aim
+    internal: true
+    options:
+      - "LBU (Load, Battery, Utility)"
+      - "BLU (Battery, Load, Utility)"
+    initial_option: "LBU (Load, Battery, Utility)"
+    optimistic: true
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    id: energy_use_mode
+    name: "Energy use mode (parameter 00)"
+    address: 5018
+    entity_category: config
+    optimistic: true
+    # Option strings are the core's Voltronic names; values are the PowMr
+    # indices from odya inverter.yaml (0 Utility first (USB) -> UTI,
+    # 1 Solar first (SUB) -> SUB, 2 SBU priority -> SBU).
+    optionsmap:
+      "UTI (Utility only)": 0
+      "SUB (Solar/utility/battery)": 1
+      "SBU (Solar/battery/utility)": 2
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    id: charger_source_priority
+    name: "Charger source priority (parameter 10)"
+    address: 5017
+    entity_category: config
+    optimistic: true
+    # odya indices: 0 Utility first (not exposed), 1 Solar first -> CSO,
+    # 2 Solar and Utility -> SNU, 3 Only solar -> OSO.
+    optionsmap:
+      "CSO (Solar first)": 1
+      "SNU (Solar and utility)": 2
+      "OSO (Solar only)": 3
+
+
+  # ============ ENERGY STRATEGY ============
+  # Replaces the old "Winter Mode" and "Battery Preserve Mode" switches. All three
+  # options run the same reserve logic; they differ in how much autonomy the reserve
+  # has to cover and how eagerly the grid is used to rebuild it.
+  #
+  #   Sun     ${reserve_hours_sun}h of autonomy. Solar covers the day, the battery is a
+  #           night buffer. The grid is essentially never used to charge.
+  #   Reserve ${reserve_hours_reserve}h of autonomy — one rolling-blackout block. The
+  #           battery works freely above the reserve; the grid only refills it.
+  #   Backup  Battery held at ${backup_target_soc}% and not discharged, grid carries the
+  #           house. UPS behaviour for unscheduled outages.
+
+
+text_sensor:
+  # Read-back decoders for the two write selects. The selects themselves are
+  # optimistic; these text sensors (written the same way odya does) are the
+  # source of truth for live verification of byte order and the UTI=USB map.
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4536
+    name: "Charger source priority (read-back)"
+    entity_category: diagnostic
+    register_type: holding
+    response_size: 2
+    raw_encode: HEXBYTES
+    lambda: |-
+      uint16_t v = modbus::helpers::word_from_hex_str(x, 0);
+      uint16_t i = (uint16_t)((v << 8) | (v >> 8));
+      switch (i) {
+        case 0: return std::string("Utility first");
+        case 1: return std::string("Solar first");
+        case 2: return std::string("Solar and Utility");
+        case 3: return std::string("Only solar");
+        default: return std::string("Unknown");
+      }
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4537
+    name: "Output source priority (read-back)"
+    entity_category: diagnostic
+    register_type: holding
+    response_size: 2
+    raw_encode: HEXBYTES
+    lambda: |-
+      uint16_t v = modbus::helpers::word_from_hex_str(x, 0);
+      uint16_t i = (uint16_t)((v << 8) | (v >> 8));
+      switch (i) {
+        case 0: return std::string("Utility first (USB)");
+        case 1: return std::string("Solar first (SUB)");
+        case 2: return std::string("SBU priority");
+        default: return std::string("Unknown");
+      }
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4555
+    name: "Charger Status"
+    register_type: holding
+    response_size: 2
+    raw_encode: HEXBYTES
+    lambda: |-
+      uint16_t v = modbus::helpers::word_from_hex_str(x, 0);
+      uint16_t i = (uint16_t)((v << 8) | (v >> 8));
+      switch (i) {
+        case 0: return std::string("Off");
+        case 1: return std::string("Idle");
+        case 2: return std::string("Charging");
+        default: return std::string("Unknown");
+      }
+
+sensor:
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4507
+    id: battery_state_of_charge
+    name: "Battery State of Charge"
+    register_type: holding
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+    value_type: U_WORD
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8);
+    on_value:
+      - lambda: 'id(last_soc_update_ms) = millis(); id(bi_data_ms) = millis();'
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4506
+    id: battery_voltage_sensor
+    name: "Battery voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: holding
+    value_type: U_WORD
+    accuracy_decimals: 2
+    state_class: measurement
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8) * 0.1;
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4502
+    id: grid_voltage_sensor
+    name: "Grid voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: holding
+    value_type: U_WORD
+    accuracy_decimals: 1
+    state_class: measurement
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8) * 0.1;
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4503
+    name: "AC Frequency"
+    unit_of_measurement: "Hz"
+    device_class: frequency
+    register_type: holding
+    value_type: U_WORD
+    accuracy_decimals: 1
+    state_class: measurement
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8) * 0.1;
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4504
+    name: "PV Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: holding
+    value_type: U_WORD
+    accuracy_decimals: 1
+    state_class: measurement
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8) * 0.1;
+
+
+  # Single MPPT: no PV2 register exists anywhere in the PowMr map (the old
+  # 15209 next-register assumption is gone). odya reads 4505 directly as watts.
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4505
+    id: pv1_power_sensor
+    name: "PV Power"
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: holding
+    value_type: U_WORD
+    accuracy_decimals: 0
+    state_class: measurement
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8);
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4508
+    id: powmr_charge_current
+    name: "Battery Charge Current"
+    unit_of_measurement: "A"
+    device_class: current
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+    accuracy_decimals: 1
+    state_class: measurement
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8);
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4509
+    id: powmr_discharge_current
+    name: "Battery Discharge Current"
+    unit_of_measurement: "A"
+    device_class: current
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+    accuracy_decimals: 1
+    state_class: measurement
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8);
+
+
+  # Signed battery current from the two positive-magnitude registers above:
+  # + = charging, - = discharging (verify sign live).
+  - platform: template
+    id: battery_current
+    name: "Battery current"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+    lambda: |-
+      float c = id(powmr_charge_current).state;
+      float d = id(powmr_discharge_current).state;
+      if (isnan(c) || isnan(d)) return NAN;
+      return c - d;
+
+
+  - platform: template
+    id: battery_power
+    name: "Battery power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    lambda: |-
+      float i = id(battery_current).state;
+      float v = id(battery_voltage_sensor).state;
+      if (isnan(i) || isnan(v)) return NAN;
+      return i * v;
+
+
+  # 4512 Load Power (W) — mirrors the MUST adapter's output-power register.
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4512
+    id: inverter_power_sensor
+    name: "Inverter power"
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: holding
+    value_type: U_WORD
+    accuracy_decimals: 0
+    state_class: measurement
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8);
+
+
+  # No grid input power register in the PowMr map: mirrors Load Power so the
+  # core's [EH] Load Power keeps returning the load. Not a real measurement.
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4512
+    id: grid_power_sensor
+    name: "Grid power"
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: holding
+    value_type: U_WORD
+    accuracy_decimals: 0
+    state_class: measurement
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8);
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4512
+    id: load_power_sensor
+    name: "Load power"
+    disabled_by_default: true
+    unit_of_measurement: "W"
+    device_class: power
+    register_type: holding
+    value_type: U_WORD
+    accuracy_decimals: 0
+    state_class: measurement
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8);
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4510
+    name: "Load Voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    register_type: holding
+    value_type: U_WORD
+    accuracy_decimals: 1
+    state_class: measurement
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8) * 0.1;
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4514
+    name: "System load"
+    unit_of_measurement: "%"
+    register_type: holding
+    value_type: U_WORD
+    entity_category: diagnostic
+    accuracy_decimals: 0
+    state_class: measurement
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8);
+
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4516
+    name: "Binary flags"
+    register_type: holding
+    value_type: U_WORD
+    entity_category: diagnostic
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8);
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4530
+    name: "Error Code"
+    register_type: holding
+    value_type: U_WORD
+    entity_category: diagnostic
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8);
+
+  - platform: modbus_controller
+    modbus_controller_id: powmr
+    address: 4555
+    id: charger_status
+    name: "Charger Status (raw)"
+    register_type: holding
+    value_type: U_WORD
+    internal: true
+    entity_category: diagnostic
+    lambda: |-
+      return (float)((uint16_t)x << 8 | (uint16_t)x >> 8);
+
+
+  # Contract readings (bi_*). Fixed ids for the core; each mirrors one PowMr
+  # entity (or a trivial derived quantity) and holds NAN while unavailable.
+  # Internal + 60 s (Task 7b RAM): core reads id().state locally, so HA
+  # publishing is pure overhead; 60 s halved the polling rate. bi_data_ms
+  # (the staleness clock) is driven by on_value above, not by these.
+  - platform: template
+    id: bi_soc
+    internal: true
+    name: "BI SoC"
+    unit_of_measurement: "%"
+    device_class: battery
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(battery_state_of_charge).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_battery_voltage
+    internal: true
+    name: "BI Battery voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 2
+    lambda: |-
+      float v = id(battery_voltage_sensor).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_battery_power
+    internal: true
+    name: "BI Battery power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(battery_power).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_grid_voltage
+    internal: true
+    name: "BI Grid voltage"
+    unit_of_measurement: "V"
+    device_class: voltage
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 1
+    lambda: |-
+      float v = id(grid_voltage_sensor).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_load_power
+    internal: true
+    name: "BI Load power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(load_power_sensor).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_pv_power
+    internal: true
+    name: "BI PV power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(pv1_power_sensor).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_grid_power
+    internal: true
+    name: "BI Grid power"
+    unit_of_measurement: "W"
+    device_class: power
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float g = id(grid_power_sensor).state;
+      if (isnan(g)) return NAN;
+      return g < 0.0f ? -g : 0.0f;
+
+  - platform: template
+    id: bi_battery_current
+    internal: true
+    name: "BI Battery current"
+    unit_of_measurement: "A"
+    device_class: current
+    state_class: measurement
+    update_interval: 60s
+    accuracy_decimals: 1
+    lambda: |-
+      float v = id(battery_current).state;
+      if (isnan(v)) return NAN;
+      return v;
+
+  - platform: template
+    id: bi_grid_present
+    internal: true
+    name: "BI Grid present"
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float v = id(grid_voltage_sensor).state;
+      if (isnan(v)) return NAN;
+      return v > 150.0f ? 1.0f : 0.0f;
+
+  - platform: template
+    id: bi_charger_state
+    internal: true
+    name: "BI Charger state"
+    update_interval: 60s
+    accuracy_decimals: 0
+    lambda: |-
+      float s = id(charger_status).state;
+      if (isnan(s)) return NAN;
+      // 4555: 0 Off, 1 Idle, 2 Charging(active). Core uses 1 = charging, 2 = stop.
+      if (s >= 2.0f) return 1.0f;
+      return 0.0f;

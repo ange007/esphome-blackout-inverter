@@ -1,0 +1,1163 @@
+# Main control loop. It states intent through the adapter's bi_* scripts (which only
+# record it) and applies it once, at the end of every pass, through bi_sync.
+interval:
+  - interval: 30s
+    then:
+      - lambda: |-
+          // Whatever this pass decides goes to the inverter in one bi_sync, on every way out
+          // of the lambda (it returns early in many places): the adapter then writes each
+          // register once, in its safe order, instead of every intermediate wish.
+          // bi_in_pass keeps user actions triggered from inside the pass (Manual Charge
+          // turning itself off) from syncing a half-decided state.
+          id(bi_in_pass) = true;
+          struct SyncOnExit { ~SyncOnExit() { id(bi_in_pass) = false; id(bi_sync).execute(); } } sync_on_exit;
+
+          // ============ HELPER FUNCTIONS ============
+
+          const bool is_backup = (id(energy_strategy) == 2);
+
+          auto strategy_name = [&]() -> const char* {
+            switch (id(energy_strategy)) {
+              case 0:  return "☀️ SUN";
+              case 2:  return "🛡️ BACKUP";
+              default: return "🔋 RESERVE";
+            }
+          };
+
+          auto reserve_hours = [&]() -> float {
+            return blackout::ha_absent_hours(
+                blackout::effective_reserve_hours(
+                    id(reserve_hours_number).state,
+                    blackout::override_age_ms(id(reserve_hours_set_epoch),
+                        id(homeassistant_time).now().is_valid() ? (uint32_t) id(homeassistant_time).now().timestamp : 0,
+                        id(reserve_hours_set_ms), millis()),
+                    ${reserve_override_ttl_hours} * 3600000UL,
+                    id(energy_strategy), ${reserve_hours_sun}, ${reserve_hours_reserve}),
+                id(ha_absent_worst), id(energy_strategy), ${reserve_hours_worst_case});
+          };
+
+          // Reserve target SoC (%): the level that still buys the configured hours of
+          // autonomy at the load we actually expect over those hours. This replaces the
+          // old fixed winter/summer thresholds — the season is an input to the load,
+          // not a separate set of numbers.
+          //
+          // Computed by the [EH] Reserve Target SoC sensor on the same 30s cadence; read
+          // it rather than recomputing, so the number driving the charging and the number
+          // shown in HA can never disagree. NaN only on the first cycle after boot.
+          auto reserve_soc = [&]() -> float {
+            float r = id(reserve_target_soc_sensor).state;
+            if (!isnan(r)) return r;
+            return is_backup ? ${backup_target_soc} : ${reserve_soc_min};
+          };
+
+          // Grid back long enough for the house and a charge (stage 0, see grid_settle_minutes).
+          auto grid_settled = [&]() -> bool {
+            if (!id(grid_present)) return false;
+            // A reboot counts as a return: the ESP restarts several times a night, often
+            // right in a settle pause.
+            uint32_t since = id(grid_back_ms) == 0 ? millis() : millis() - id(grid_back_ms);
+            return since >= id(grid_settle_ms);
+          };
+
+          // Highest voltage of the last grid_falling_window_minutes (30 s samples, filled below where
+          // the grid is read, emptied on every loss): tells a line still sliding from a settled one.
+          static float vwin[2 * ${grid_falling_window_minutes}];
+          static uint8_t vwin_n = 0, vwin_i = 0;
+          auto voltage_falling = [&]() -> bool {
+            const float v = id(grid_voltage_sensor).state;
+            if (isnan(v)) return true;
+            float top = v;
+            for (uint8_t k = 0; k < vwin_n; k++) if (vwin[k] > top) top = vwin[k];
+            return v < top - ${grid_falling_volts};
+          };
+
+          // How long the voltage has to hold: stage_wait_ms while the last loss is under an
+          // hour old, grid_stable_minutes once the line has stayed up for an hour.
+          auto stage_wait = [&]() -> uint32_t {
+            const bool recent = id(grid_lost_ms) != 0 && millis() - id(grid_lost_ms) < 3600000UL;
+            return recent ? id(stage_wait_ms) : (uint32_t) ${grid_stable_minutes} * 60000UL;
+          };
+
+          // The voltage has held at or above grid_stable_voltage for stage_wait().
+          // No sliding test here: this also gates a charge that is running (Backup's idle SNU),
+          // and our own 5 A steps pull the line down by more than grid_falling_volts.
+          auto voltage_stable = [&]() -> bool {
+            return id(grid_good_since_ms) != 0 &&
+                   millis() - id(grid_good_since_ms) >= stage_wait();
+          };
+          // Grid charging may start or resume: back long enough and the voltage stable.
+          auto grid_ready = [&]() -> bool { return grid_settled() && voltage_stable(); };
+          // Stage 2 of a session start: the voltage has held at grid_stable_voltage for
+          // stage_wait() WITH the house on the line, and is not sliding - counted from the latest of: the
+          // voltage becoming good, the session start (house put on the grid), the end of a
+          // weak-grid spell (house handed back to the grid).
+          auto charge_stage_ready = [&]() -> bool {
+            if (!grid_settled() || id(grid_good_since_ms) == 0 || id(weak_grid)) return false;
+            const uint32_t now = millis();
+            uint32_t since = now - id(grid_good_since_ms);
+            // The house went on the grid when stage 0 ended (grid_settled() makes this >= 0).
+            if (id(grid_back_ms) != 0) {
+              const uint32_t on_grid = now - id(grid_back_ms) - id(grid_settle_ms);
+              if (on_grid < since) since = on_grid;
+            }
+            if (now - id(session_start_ms) < since) since = now - id(session_start_ms);
+            if (id(weak_cleared_ms) != 0 && now - id(weak_cleared_ms) < since) since = now - id(weak_cleared_ms);
+            // Nothing of ours is drawn yet, so a sliding voltage is the line's own.
+            return since >= stage_wait() && !voltage_falling();
+          };
+
+          // The battery has SoC to spare for carrying the house off a bad line. Backup is there
+          // to keep the pack high: it lends the battery only down to its target minus
+          // reserve_hold_band minus 10 (70%), not to the critical floor.
+          auto battery_can_carry = [&](float soc) -> bool {
+            const float floor = id(energy_strategy) == 2
+                ? ${backup_target_soc} - ${reserve_hold_band} - 10.0f
+                : ${critical_low_soc} + ${weak_grid_soc_margin};
+            return !isnan(soc) && soc > floor;
+          };
+          // Weak grid and SoC to spare: run the house off the battery (SBU), not the grid.
+          auto weak_grid_relief = [&](float soc) -> bool {
+            return id(weak_grid) && battery_can_carry(soc);
+          };
+
+          // Grid charge current to aim for: Target Charge Current, lowered by a relay-trip cap.
+          auto charge_target_amps = [&]() -> float {
+            float t = id(target_charge_amps);
+            float cap = id(relay_cap_amps);
+            return (cap > 0.0f && cap < t) ? cap : t;
+          };
+
+          // Pause/resume grid charging (snu = allowed). A paused session still counts as a
+          // session (the adapter keeps its day-time grid mode). The adapter compares with the
+          // read-back and writes only a change; the current is bi_charge_limit's.
+          auto write_charger_priority = [&](bool snu) {
+            id(bi_grid_permit).execute(snu, id(charge_active) || id(charge_paused));
+          };
+
+          // HA's outage charge plan, 0 when absent or stale (see the Outage Plan SoC number).
+          auto plan_soc = [&]() -> float {
+            auto tn = id(homeassistant_time).now();
+            return blackout::effective_plan_soc(id(outage_plan_soc).state,
+                id(outage_plan_set_epoch), tn.is_valid() ? (uint32_t) tn.timestamp : 0,
+                12UL * 3600UL);
+          };
+
+          // Where a grid charge session should end.
+          //
+          // Sized off the PEAK reserve, not the current one. At 01:00 the next six hours
+          // are the quietest of the day, so the current reserve is low — charging to that
+          // would leave nothing for the evening peak and push the top-up onto the day
+          // tariff. The peak reserve buys tomorrow's worst window at tonight's price.
+          // Capped at night_target_soc_max unless the outage plan needs more (then up to 100%).
+          auto night_target_soc = [&]() -> float {
+            if (is_backup) return ${backup_target_soc};
+            float peak = id(reserve_peak_soc_sensor).state;
+            if (isnan(peak)) peak = ${reserve_soc_min};
+            float t = peak + ${reserve_night_margin};
+            auto tn = id(homeassistant_time).now();
+            t += blackout::effective_night_bump(id(night_charge_bump).state,
+                id(night_bump_set_epoch), tn.is_valid() ? (uint32_t) tn.timestamp : 0,
+                12UL * 3600UL);
+            // The outage plan may lift the night past the everyday cap, to 100%.
+            return blackout::night_target_with_plan(t, ${night_target_soc_max}, plan_soc());
+          };
+          
+          // These three write inverter holding registers, which MUST units persist in
+          // EEPROM. The idle block runs every 90s forever, so writing unconditionally
+          // costs ~1000 EEPROM writes per register per day for no reason. Compare first.
+          auto set_energy_mode = [&](int house) {
+            // house: 0 = battery, 1 = grid. Stage 0 of a grid return: the house stays on the
+            // battery until the line has been back grid_settle_ms, if the battery can carry it.
+            if (house == 1 && id(grid_present) && !grid_settled() &&
+                battery_can_carry(id(battery_state_of_charge).state)) {
+              house = 0;
+            }
+            if (house != id(cmd_house))
+              ESP_LOGI("mode", "⚙️ House → %s", house ? "grid" : "battery");
+            id(cmd_house) = house;
+            id(bi_house).execute(house);
+          };
+
+          auto set_charger_priority = [&](bool snu) {
+            id(bi_grid_permit).execute(snu, id(charge_active) || id(charge_paused));
+            ESP_LOGD("mode", "⚙️ Charger priority → %s", snu ? "on" : "off");
+          };
+
+          // WARNING: never set BLU at night — the inverter freezes in bypass.
+          // target: 0 = load, 1 = battery. The adapter enforces never-battery-at-night.
+          auto set_solar_aim = [&](int target) {
+            id(cmd_solar) = target;
+            id(bi_solar_priority).execute(target);
+            ESP_LOGI("mode", "⚙️ Solar aim → %d", target);
+          };
+
+          // Returns true if automation is allowed to start charging
+          auto can_auto_start = [&]() -> bool {
+            return !id(manual_charge_active) || id(auto_disable_manual_charge);
+          };
+
+          // Inverter state while NOT grid charging, graded by distance to the reserve:
+          //
+          //   SoC above reserve   SBU + LBU + OSO  battery works freely, grid untouched
+          //   inside hold band    SUB + BLU + OSO  grid carries the load so the reserve
+          //                                        stops draining, PV rebuilds the pack,
+          //                                        still no grid charging
+          //   Backup strategy     SUB + LBU + SNU  battery held, grid carries everything
+          //
+          // The hold band is what keeps the reserve intact without the old winter mode's
+          // habit of running the whole house off the grid year-round.
+          auto apply_idle_modes = [&](float soc, float reserve) {
+            auto t = id(homeassistant_time).now();
+            bool night = !t.is_valid() || (t.hour >= ${night_start_hour} || t.hour < ${night_end_hour});
+
+            // Latch the hold state with a deadband and a minimum dwell. SBU<->SUB moves
+            // the inverter's transfer relay; SoC hovering on the threshold must not be
+            // able to work it every 30s.
+            if (is_backup || night || isnan(soc)) {
+              id(hold_mode_active) = false;
+            } else {
+              bool want_hold = id(hold_mode_active)
+                  ? (soc < reserve + ${reserve_mode_deadband})
+                  : (soc < reserve);
+              if (want_hold != id(hold_mode_active)) {
+                unsigned long dwell_ms = ${mode_switch_dwell_minutes} * 60000UL;
+                if (id(last_mode_switch_ms) == 0 ||
+                    (millis() - id(last_mode_switch_ms)) >= dwell_ms) {
+                  id(hold_mode_active) = want_hold;
+                  id(last_mode_switch_ms) = millis();
+                  ESP_LOGI("reserve", "%s hold band (%.1f%% vs reserve %.0f%%)",
+                           want_hold ? "⤵️ Enter" : "⤴️ Leave", soc, reserve);
+                }
+              }
+            }
+
+            // Night hold: at night the battery may run the house only down to the night
+            // target; below it the grid carries the load. On 12 Oct the pack reached 98% at
+            // 04:10, ran the house down to 84% by 06:37, and the day started at 85% with a
+            // 90% target. Anything under the target was going to be bought straight back
+            // at the restart threshold anyway.
+            //
+            // Above the target the battery works as usual, which is what a sunny tomorrow
+            // wants: the target is low then (no forecast bump), so the pack empties to it
+            // overnight and the morning sun has room. A grey tomorrow raises the target and
+            // keeps what was bought.
+            //
+            // Latched with a 2% deadband so SoC sitting on the target cannot flip the
+            // transfer relay. Needs a real clock (an assumed night must not park the house
+            // on the grid) and the grid itself — in an outage the battery runs regardless.
+            static bool night_hold_latched = false;
+            if (night && t.is_valid() && id(grid_present) && id(night_charge_automation_enabled)
+                && !isnan(soc)) {
+              const float target = night_target_soc();
+              night_hold_latched = night_hold_latched ? (soc < target + 2.0f) : (soc <= target);
+            } else {
+              night_hold_latched = false;
+            }
+            const bool night_hold = night_hold_latched;
+
+            // Plan hold: by day, with an outage plan in force, the grid carries the house
+            // while SoC is at or below the plan. The plan models grid hours as grid-fed; in
+            // SBU the house ran off the pack instead, the night charge drained away before
+            // the block and was bought back at the day rate, and with a 100% emergency plan
+            // the pack cycled 90 -> 85 -> 90 every hour. Same 2% deadband as the night hold.
+            // Minimum dwell as for the reserve hold: HA rewrites the plan every 30 min and it
+            // drifts, which must not work the SBU<->SUB relay at that rate.
+            static bool plan_hold_latched = false;
+            {
+              const float plan = plan_soc();
+              if (!night && t.is_valid() && id(grid_present) && plan > 0.0f && !isnan(soc)) {
+                bool want = plan_hold_latched ? (soc < plan + 2.0f) : (soc <= plan);
+                if (want != plan_hold_latched) {
+                  unsigned long dwell_ms = ${mode_switch_dwell_minutes} * 60000UL;
+                  if (id(last_mode_switch_ms) == 0 || millis() - id(last_mode_switch_ms) >= dwell_ms) {
+                    plan_hold_latched = want;
+                    id(last_mode_switch_ms) = millis();
+                    ESP_LOGI("plan", "%s plan hold (%.1f%% vs plan %.0f%%)",
+                             want ? "⤵️ Enter" : "⤴️ Leave", soc, plan);
+                  }
+                }
+              } else {
+                plan_hold_latched = false;
+              }
+            }
+
+            int house;
+            int aim;
+            bool snu;
+            if (weak_grid_relief(soc)) {
+              // Weak grid: every hold would put the house (400-700 W) on a line that is
+              // already sagging toward the relay's trip point. The battery takes it.
+              house = 0;
+              aim  = 0;
+              snu = false;
+            } else if (is_backup) {
+              house = 1;
+              aim  = 0;
+              // No grid charging until a returned grid has settled and its voltage is stable.
+              snu = grid_ready();
+            } else if (night_hold) {
+              // LBU, not BLU: BLU after dark leaves the inverter stuck in bypass.
+              house = 1;
+              aim  = 0;
+              snu = false;
+            } else if (id(hold_mode_active) || plan_hold_latched) {
+              house = 1;
+              aim  = 1;
+              snu = false;
+            } else {
+              house = 0;
+              aim  = 0;
+              snu = false;
+            }
+            set_energy_mode(house);
+            // Backup going back to grid charging (grid settled): the limit first. The inverter leaves
+            // 80 A in 20125 after an outage, and the idle guard only sees it a poll later.
+            if (snu &&
+                !(id(bi_ctl_grid_charge_on).state == 1.0f) &&
+                !(id(bi_ctl_grid_charge_amps).state <= ${charge_amps_start})) {
+              id(cmd_charge_amps) = (float) ${charge_amps_start};
+              id(bi_charge_limit).execute((float) ${charge_amps_start});
+              id(last_step_ms) = millis();
+            }
+            set_charger_priority(snu);
+            set_solar_aim(aim);
+          };
+
+          // Fires throttled HA event notification (1h cooldown per key)
+          auto fire_throttled_event = [&](const char* event_key, const char* title, const char* message, const char* priority = "normal") {
+            // Suppress non-critical notifications for 5 min after boot
+            if (id(boot_notifications_suppressed) && strcmp(priority, "high") != 0) {
+              ESP_LOGD("notify", "⏭️ Boot suppressed: %s", event_key);
+              return false;
+            }
+
+            unsigned long now = millis();
+            unsigned long throttle_ms = 3600000;  // 1 hour
+
+            // Treat a never-seen key as "never fired → allow now". Using map[key] would
+            // insert 0 and suppress the first event of every key for the first hour of
+            // uptime. Unsigned subtraction already handles the millis() rollover.
+            auto it = id(notification_timers).find(event_key);
+            bool first_seen = (it == id(notification_timers).end());
+            if (first_seen || (now - it->second) > throttle_ms) {
+              id(event_id_str) = event_key;
+              id(event_title) = title;
+              id(event_message) = message;
+              id(event_priority) = priority;
+              id(send_battery_event)->execute();
+          
+              id(notification_timers)[event_key] = now;
+              ESP_LOGI("notify", "📢 %s", event_key);
+              return true;
+            }
+            ESP_LOGD("notify", "⏭️ Throttled: %s", event_key);
+            return false;
+          };
+          
+          // STOP CHARGE
+          auto stop_charge = [&](float soc, float reserve) {
+            // Idle current: Backup keeps charging at it, so it obeys the relay-trip cap.
+            float idle_amps = ${charge_amps_idle};
+            if (id(relay_cap_amps) > 0.0f && id(relay_cap_amps) < idle_amps) idle_amps = id(relay_cap_amps);
+            id(cmd_charge_amps) = idle_amps;
+            id(bi_charge_limit).execute(idle_amps);
+
+            // Open the cut-off back up so the sun can finish the pack. Must be a value
+            // the inverter accepts — see blackout::CELL_V_MAX. Backup idles on SNU, so
+            // there it stays at the backup target.
+            id(active_stop_voltage) = is_backup
+                ? blackout::charge_stop_voltage(${backup_target_soc}, ${battery_cells_s})
+                : blackout::max_stop_voltage(${battery_cells_s});
+            id(cmd_stop_soc) = is_backup ? ${backup_target_soc} : 100.0f;  // 100% = the open ceiling
+            id(bi_charge_stop).execute(id(cmd_stop_soc));
+
+            // Session over before the idle modes are chosen: they must not keep the
+            // session's day-time grid mode (UTI) for the next minute and a half.
+            id(charge_active) = false;
+            id(ramp_up_active) = false;
+            id(charge_paused) = false;
+            apply_idle_modes(soc, reserve);
+            id(opportunistic_armed) = false;
+          };
+
+          // START CHARGE. `stop_soc` is where this session ends — stored in
+          // active_target_soc so one stop rule covers every path that starts a charge.
+          auto start_charge_with_target = [&](float target_current, float stop_soc) {
+            auto t = id(homeassistant_time).now();
+            bool night = !t.is_valid() || (t.hour >= ${night_start_hour} || t.hour < ${night_end_hour});
+
+            // Current limit FIRST, then the permission to charge from the grid: the inverter
+            // resets 20125 to its 80 A maximum during every outage (11 times in 12 days to
+            // 3 Nov), and SNU before the limit is a moment of up to ~4 kW on a weak line.
+            id(cmd_charge_amps) = (float) ${charge_amps_start};
+            id(bi_charge_limit).execute((float) ${charge_amps_start});
+
+            // Stage 1: the house goes on the grid (the mode), the charger stays off (OSO).
+            // The ramp adds the charge once the voltage has held with that load on the line
+            // (charge_stage_ready): on 3 Nov house and charge hit a weak line at once.
+            set_energy_mode(1);
+            id(bi_grid_permit).execute(false, true);  // stage 1 of a session (flags are set below)
+            // Daytime: BLU so PV goes into the pack alongside the charger. Night: LBU,
+            // BLU would leave the inverter stuck in bypass.
+            set_solar_aim(night ? 0 : 1);
+
+            if (!(target_current >= ${charge_amps_min} && target_current <= ${charge_amps_max})) {
+              target_current = ${charge_amps_default};
+            }
+
+            id(target_charge_amps) = target_current;
+            id(active_charge_amps) = ${charge_amps_start};
+            id(ramp_up_active) = true;
+            id(charge_paused) = true;     // stage 1; the ramp resumes it (stage 2)
+            id(last_step_ms) = millis();  // the first step waits like every other one
+            id(session_start_ms) = millis();
+            id(session_night) = night;
+            if (id(rtc_state_loaded)) blackout::rtc_state_save(id(reserve_hours_set_epoch), id(session_night), id(modbus_heal_streak));
+            id(active_target_soc) = stop_soc;
+
+            // Write target stop voltage to batt_stop_chg (modbus 20119)
+            float chg_stop_v = blackout::charge_stop_voltage(stop_soc, ${battery_cells_s});
+            id(active_stop_voltage) = chg_stop_v;  // single source of truth for watchdog/boot
+            id(cmd_stop_soc) = stop_soc;
+            id(bi_charge_stop).execute(stop_soc);
+
+            ESP_LOGI("charge", "%s → %.0f%%: stop=%.1fV, %.0fA",
+                    strategy_name(), stop_soc, chg_stop_v, target_current);
+
+            id(charge_active) = true;
+          };
+          
+          // ============ MAIN LOGIC ============
+          if (id(full_manual_mode)) {
+            id(hands_off) = true;
+            static int log_counter = 0;
+            if (log_counter++ >= 2) {
+              ESP_LOGI("manual", "🔒 FULL MANUAL MODE");
+              log_counter = 0;
+            }
+            id(night_target_now) = NAN;  // not computed while the automation is off
+            id(grid_good_since_ms) = 0;  // re-measured after leaving Full Manual
+
+            // Grid sag guard, the one thing still done here: a grid charge set by hand
+            // must not trip the breaker either. Below grid_voltage_min the grid charger
+            // current steps down; at grid_voltage_resume it climbs back, never above what
+            // was set by hand. Nothing else is touched.
+            static float hand_amps = NAN;  // the hand-set value while it is held down
+            float gv = id(grid_voltage_sensor).state;
+            float amps = id(bi_ctl_grid_charge_amps).state;
+            bool grid_charging = id(grid_present) &&
+                (id(bi_ctl_grid_charge_on).state == 1.0f);
+            if (!grid_charging || isnan(gv) || gv < 100 || isnan(amps)) {
+              hand_amps = NAN;
+            } else if (gv < ${grid_voltage_min} && amps > ${charge_amps_start}) {
+              if (isnan(hand_amps)) hand_amps = amps;
+              float lower = amps - ${charge_amps_step};
+              if (lower < ${charge_amps_start}) lower = ${charge_amps_start};
+              // Amps-only adjustment via the manual path: bi_manual_amps
+              // ignores hands_off (stays true) and never touches priority
+              // or mode, exactly like the original direct register write.
+              id(cmd_charge_amps) = lower;
+              id(bi_manual_amps).execute(lower);
+              ESP_LOGW("ramp", "⚠️ Grid LOW (full manual): %.1fV → %.0fA", gv, lower);
+              char buf[120];
+              snprintf(buf, sizeof(buf), "Voltage %.0fV\nCurrent %.0fA (full manual)", gv, lower);
+              fire_throttled_event("grid_voltage", "⚠️ Voltage Sag", buf, "high");
+            } else if (!isnan(hand_amps) && gv >= ${grid_voltage_resume}) {
+              float higher = amps + ${charge_amps_step};
+              if (higher >= hand_amps) { higher = hand_amps; hand_amps = NAN; }
+              id(cmd_charge_amps) = higher;
+              id(bi_manual_amps).execute(higher);
+              ESP_LOGI("ramp", "⬆️ Grid OK (full manual): %.0fA", higher);
+            }
+            return;
+          }
+          id(hands_off) = false;
+          float soc = id(battery_state_of_charge).state;
+          float voltage = id(battery_voltage_sensor).state;
+          auto time = id(homeassistant_time).now();
+
+          // No wall clock is a reason to skip the calendar-driven parts, NOT a reason to
+          // stop managing the battery. This used to `return` here, which meant that an
+          // ESP reboot while Home Assistant was down left the pack with no reserve, no
+          // hold band, no emergency charge and no over/under-voltage protection at all.
+          //
+          // Everything that only needs millis() keeps running: protection, grid
+          // detection, the reserve, the hold band, emergency and post-outage charging,
+          // the watchdog and the ramp. Only the night window, the morning stop, the
+          // hourly profile and the daily outage counters need to know the date.
+          const bool clock_ok = time.is_valid();
+          if (!clock_ok) {
+            static int nt_counter = 0;
+            if (nt_counter++ >= 20) {  // ~10 min apart
+              ESP_LOGW("main", "⏰ No clock — running reserve and protection only");
+              nt_counter = 0;
+            }
+          }
+
+          if (isnan(soc) || isnan(voltage)) {
+            ESP_LOGW("main", "Sensor NaN! SoC=%.1f V=%.1f", soc, voltage);
+            id(night_target_now) = NAN;
+            return;
+          }
+
+          // Stale-data guard: if the SoC sensor hasn't updated in ~5 cycles the Modbus
+          // bus is likely silent and `soc` is a frozen last value — don't act on it.
+          if (id(last_soc_update_ms) != 0 &&
+              (millis() - id(last_soc_update_ms)) > 150000UL) {
+            ESP_LOGW("main", "SoC stale (%lus) — Modbus silent? Pausing automation",
+                     (unsigned long)((millis() - id(last_soc_update_ms)) / 1000UL));
+            id(night_target_now) = NAN;
+            return;
+          }
+
+          int hour = clock_ok ? time.hour : -1;
+          int minute = clock_ok ? time.minute : -1;
+
+          // With no clock, assume night. That keeps solar_use_aim on LBU: BLU after dark
+          // freezes the inverter in bypass, and guessing "day" would risk exactly that.
+          bool is_night = clock_ok ? (hour >= ${night_start_hour} || hour < ${night_end_hour})
+                                   : true;
+
+          // ============ HOURLY LOAD PROFILE ============
+          // Average the load per hour-of-day so the reserve can be sized against the
+          // hours an outage would actually cover, not against whatever the load happens
+          // to be at the moment the reserve is computed.
+          // Skip implausible samples so a spell of bypass cannot teach the profile that
+          // this hour of the day costs nothing.
+          float load_now = id(true_load_power).state;
+          if (clock_ok && !isnan(load_now) && load_now >= ${min_valid_load_w}) {
+            id(hour_accum_w) += load_now;
+            id(hour_accum_samples)++;
+          }
+          if (clock_ok && id(last_profile_hour) != (int8_t) hour) {
+            // At least 10 minutes of samples. After a reboot the first bucket holds only
+            // the tail of the hour, and a few minutes of kettle would otherwise be folded
+            // in with the weight of a whole hour.
+            if (id(last_profile_hour) >= 0 && id(hour_accum_samples) >= 20) {
+              float avg_w = id(hour_accum_w) / id(hour_accum_samples);
+              blackout::learn_hourly_load(id(hourly_load_profile).data(), id(last_profile_hour), avg_w);
+              ESP_LOGI("profile", "📊 Hour %02d: %.0fW", (int) id(last_profile_hour), avg_w);
+            }
+            id(last_profile_hour) = (int8_t) hour;
+            id(hour_accum_w) = 0.0f;
+            id(hour_accum_samples) = 0;
+          }
+
+          // ============ GRID PRESENCE / OUTAGE LOG ============
+          // Daily counters roll over on the date, not on a timer, so a reboot in the
+          // middle of the day keeps today's tally.
+          if (clock_ok && id(outage_stats_day) != (int8_t) time.day_of_month) {
+            id(outage_stats_day) = (int8_t) time.day_of_month;
+            id(outage_seconds_today) = 0;
+            id(outage_count_today) = 0;
+          }
+          if (id(relay_cap_amps) > 0.0f && (int32_t) (millis() - id(relay_cap_until_ms)) >= 0) {
+            id(relay_cap_amps) = 0.0f;
+            ESP_LOGI("ramp", "Relay-trip current cap lifted");
+          }
+
+          float grid_v = id(grid_voltage_sensor).state;
+          bool grid_now = !isnan(grid_v) && grid_v >= ${grid_present_min_voltage};
+          // The first reading after boot only seeds the state: grid_present starts as a guess,
+          // and a restart in the middle of an outage is not a new outage (it used to count
+          // one, and the return then looked like a 20-minute relay trip).
+          if (!id(grid_seeded)) {
+            if (!isnan(grid_v)) {
+              id(grid_seeded) = true;
+              id(grid_present) = grid_now;
+              if (!grid_now) {
+                id(grid_lost_ms) = 0;  // started before boot: unknown
+                // The outage the manual charge was for is under way: let the return end it.
+                id(manual_off_pending) = id(manual_charge_active) && id(auto_disable_manual_charge);
+              }
+            }
+          } else if (grid_now != id(grid_present)) {
+            if (!grid_now) {
+              // Lost again within an hour of the last loss: the line is not done settling.
+              {
+                const bool repeat = id(grid_lost_ms) != 0 && millis() - id(grid_lost_ms) < 3600000UL;
+                uint32_t w = repeat ? id(stage_wait_ms) * 2UL : ${grid_stable_minutes} * 60000UL;
+                if (w > ${grid_stable_max_minutes} * 60000UL) w = ${grid_stable_max_minutes} * 60000UL;
+                id(stage_wait_ms) = w;
+                uint32_t sw = repeat ? id(settle_wait_ms) * 2UL : ${grid_settle_minutes} * 60000UL;
+                if (sw > ${grid_settle_max_minutes} * 60000UL) sw = ${grid_settle_max_minutes} * 60000UL;
+                id(settle_wait_ms) = sw;
+                if (repeat) ESP_LOGW("grid", "⚡ Repeated loss — house on the grid after %lu min, charging after %lu more",
+                                     (unsigned long) (sw / 60000UL), (unsigned long) (w / 60000UL));
+              }
+              vwin_n = 0;
+              vwin_i = 0;
+              id(grid_lost_ms) = millis();
+              id(outage_count_today)++;
+              ESP_LOGW("grid", "⚡ Grid LOST (%.0fV) — outage #%u today",
+                       grid_v, (unsigned) id(outage_count_today));
+              fire_throttled_event("grid_lost", "⚡ Grid Outage", "Running on battery", "high");
+              // Remember what we were drawing from the grid: a quick return means the house
+              // relay, not the grid. Nothing is drawn while a session is paused.
+              const bool backup_idle_snu = !id(charge_active) && id(energy_strategy) == 2 &&
+                  (id(bi_ctl_grid_charge_on).state == 1.0f);
+              const bool drawing = (id(charge_active) && !id(charge_paused)) || backup_idle_snu;
+              id(relay_trip_amps) = !drawing ? 0.0f
+                  : (id(charge_active) ? id(active_charge_amps) : id(bi_ctl_grid_charge_amps).state);
+              id(relay_trip_suspect) = drawing && id(last_step_up_ms) != 0
+                  && millis() - id(last_step_up_ms) <= ${relay_trip_window_s} * 1000UL;
+              // Backup idles on SNU: same pause, from the minimum (apply_idle_modes puts SNU
+              // back once the grid has settled).
+              if (backup_idle_snu) {
+                write_charger_priority(false);
+                id(cmd_charge_amps) = (float) ${charge_amps_start};
+                id(bi_charge_limit).execute((float) ${charge_amps_start});
+              }
+              // A running session is paused now and starts over from charge_amps_start once
+              // the grid has settled; pausing here, not at the return, means the first poll
+              // after the return cannot catch the charger on SNU.
+              if (id(charge_active)) {
+                id(active_charge_amps) = ${charge_amps_start};
+                id(ramp_up_active) = true;
+                if (!id(charge_paused)) {
+                  write_charger_priority(false);
+                  id(charge_paused) = true;
+                }
+              }
+              // Manual Charge was the run-up to this outage; Auto-Disable ends it so the
+              // grid's return is the automation's again. Decided at the return (see
+              // manual_off_pending): our own charging trips the house relay too.
+              id(manual_off_pending) = id(manual_charge_active) && id(auto_disable_manual_charge);
+            } else {
+              // grid_lost_ms 0: lost before the boot, real length unknown — never a relay trip.
+              const bool loss_known = id(grid_lost_ms) != 0;
+              unsigned long dur_s = (millis() - id(grid_lost_ms)) / 1000UL;
+              id(outage_seconds_today) += dur_s;
+              // Under rolling blackouts the night charge window may never arrive with
+              // power on it — take the reserve back as soon as the grid returns.
+              id(opportunistic_armed) = true;
+              ESP_LOGW("grid", "✅ Grid BACK after %lus — reserve top-up armed", dur_s);
+              char gbuf[100];
+              snprintf(gbuf, sizeof(gbuf), "Grid back after %lu min", dur_s / 60UL);
+              fire_throttled_event("grid_back", "✅ Grid Restored", gbuf);
+              if (id(manual_off_pending) && id(manual_charge_active)) {
+                id(manual_off_pending) = false;
+                if (!loss_known || dur_s > ${relay_trip_return_minutes} * 60UL) {
+                  ESP_LOGW("manual", "🔧 Manual Charge off: outage of %lu min", dur_s / 60UL);
+                  id(manual_charge_switch).turn_off();
+                } else {
+                  ESP_LOGW("manual", "🔧 Manual Charge kept: %lus loss, likely the relay", dur_s);
+                }
+              }
+              id(manual_off_pending) = false;  // a Manual switched off meanwhile leaves none behind
+              if (loss_known && id(relay_trip_amps) > 0.0f && !isnan(id(relay_trip_amps))
+                  && dur_s <= ${relay_trip_return_minutes} * 60UL) {
+                float cap = id(relay_trip_amps) - ${relay_trip_backoff_amps};
+                if (cap < ${charge_amps_start}) cap = ${charge_amps_start};
+                if (id(relay_cap_amps) <= 0.0f || cap < id(relay_cap_amps)) id(relay_cap_amps) = cap;
+                id(relay_cap_until_ms) = millis() + ${relay_cap_minutes} * 60000UL;
+                ESP_LOGW("ramp", "⚡ Likely relay trip at %.0fA (back in %lus) → cap %.0fA for %d min",
+                         id(relay_trip_amps), dur_s, id(relay_cap_amps), ${relay_cap_minutes});
+                char rbuf[120];
+                snprintf(rbuf, sizeof(rbuf), "Grid dropped while charging at %.0fA, back in %lu min\nCharging capped at %.0fA for %d min",
+                         id(relay_trip_amps), dur_s / 60UL, id(relay_cap_amps), ${relay_cap_minutes});
+                fire_throttled_event("relay_trip", "⚡ Relay Trip?", rbuf, "high");
+              }
+              id(relay_trip_amps) = 0.0f;
+              id(grid_back_ms) = millis();
+              id(grid_settle_ms) = id(settle_wait_ms);
+              // A long outage: every boiler and fridge on the line comes back at once (see
+              // grid_settle_long_minutes). Unknown length (lost before the boot) counts as long.
+              if ((!loss_known || dur_s >= ${long_outage_hours} * 3600UL)
+                  && id(grid_settle_ms) < ${grid_settle_long_minutes} * 60000UL) {
+                id(grid_settle_ms) = ${grid_settle_long_minutes} * 60000UL;
+                ESP_LOGW("grid", "⏳ Long outage — house on the battery for %d min while the line settles",
+                         ${grid_settle_long_minutes});
+              }
+              if (id(relay_trip_suspect) && id(grid_settle_ms) < ${relay_trip_settle_minutes} * 60000UL)
+                id(grid_settle_ms) = ${relay_trip_settle_minutes} * 60000UL;
+              if (id(relay_trip_suspect))
+                ESP_LOGW("ramp", "⚡ Grid lost right after a step up — %d min pause before charging",
+                         ${relay_trip_settle_minutes});
+            }
+            id(grid_present) = grid_now;
+          }
+
+          // Voltage stability and weakness (see grid_stable_voltage / weak_grid_soc_margin).
+          if (id(grid_present) && !isnan(grid_v) && grid_v >= ${grid_present_min_voltage}) {
+            vwin[vwin_i] = grid_v;
+            vwin_i = (vwin_i + 1) % (2 * ${grid_falling_window_minutes});
+            if (vwin_n < 2 * ${grid_falling_window_minutes}) vwin_n++;
+          }
+          if (id(grid_present) && !isnan(grid_v) && grid_v >= ${grid_stable_voltage}) {
+            if (id(grid_good_since_ms) == 0) id(grid_good_since_ms) = millis() | 1u;
+          } else {
+            id(grid_good_since_ms) = 0;
+          }
+          if (id(grid_present) && !isnan(grid_v) && grid_v >= ${weak_grid_voltage} + ${weak_grid_clear_margin}) {
+            if (id(weak_ok_since_ms) == 0) id(weak_ok_since_ms) = millis() | 1u;
+          } else {
+            id(weak_ok_since_ms) = 0;
+          }
+          if (id(grid_present) && !isnan(grid_v) && grid_v < ${weak_grid_voltage}) {
+            if (!id(weak_grid)) {
+              // Weak again within the hour: stay on the battery twice as long this time.
+              const bool repeat = id(weak_cleared_ms) != 0 && millis() - id(weak_cleared_ms) < 3600000UL;
+              uint32_t hold = repeat ? id(weak_hold_ms) * 2UL : ${weak_grid_min_minutes} * 60000UL;
+              if (hold > ${weak_grid_max_minutes} * 60000UL) hold = ${weak_grid_max_minutes} * 60000UL;
+              id(weak_hold_ms) = hold;
+              ESP_LOGW("ramp", "🔻 Weak grid %.0fV — the house goes on the battery (%lu min)",
+                       grid_v, (unsigned long) (hold / 60000UL));
+            }
+            id(weak_grid) = true;
+            id(weak_grid_since_ms) = millis();
+          } else if (!id(grid_present) ||
+                     (id(weak_ok_since_ms) != 0 &&
+                      millis() - id(weak_ok_since_ms) >= ${grid_stable_minutes} * 60000UL &&
+                      millis() - id(weak_grid_since_ms) >= id(weak_hold_ms))) {
+            if (id(weak_grid)) {
+              if (id(grid_present)) ESP_LOGI("ramp", "🔺 Grid stable again");
+              id(weak_cleared_ms) = millis() | 1u;
+            }
+            id(weak_grid) = false;
+          }
+
+          // ============ RESERVE ============
+          float reserve = reserve_soc();
+          float hold_floor = reserve - ${reserve_hold_band};
+          float night_target = night_target_soc();
+          id(night_target_now) = night_target;
+
+          // Back at the reserve → nothing left for the post-outage top-up to do.
+          if (soc >= reserve) {
+            id(opportunistic_armed) = false;
+          }
+
+          // ============ WATCHDOG ============
+          if (id(charge_active) && !id(full_manual_mode)) {
+            // Day/night and grid can change mid-session: house on grid by day, off
+            // battery after dark or once the grid is gone. The adapter derives the
+            // exact energy mode from house + session + its own night test.
+            // Every pass: the adapter heals drift from its read-back, and set_energy_mode holds
+            // the house on the battery while a grid return settles (stage 0).
+            set_energy_mode((id(charge_paused) && weak_grid_relief(soc)) ? 0 : 1);
+          
+            float current_grid = id(bi_ctl_grid_charge_amps).state;
+            // Priority and solar aim too, once the session has had a poll to show its own
+            // writes: a lost SNU left a session charging nothing until the morning, and a
+            // day session running past 23:00 kept BLU, which strands the inverter in bypass.
+            if (millis() - id(session_start_ms) > 90000UL) {
+              set_charger_priority(!id(charge_paused));
+              set_solar_aim(is_night ? 0 : 1);
+            }
+
+            // The ramp below owns the current; the watchdog only re-asserts it. Following the
+            // target here made a lifted relay-trip cap jump straight to the full current.
+            float expected = id(active_charge_amps);
+            if (!isnan(current_grid) && fabsf(current_grid - expected) > 1.0f) {
+              id(cmd_charge_amps) = expected;
+              id(bi_charge_limit).execute(expected);
+              ESP_LOGW("watchdog", "⚠️ Current reset to %.0fA", expected);
+            }
+
+            // Watchdog: verify batt_stop_chg in case inverter reset the register.
+            // Compare against the single source of truth (set by start/manual/strategy)
+            // so the reserve-driven target is never overwritten with a stale default.
+            float expected_stop_v = id(active_stop_voltage);
+            float actual_stop_soc = id(bi_ctl_stop_soc).state;
+            float actual_stop_v = isnan(actual_stop_soc) ? NAN
+                : blackout::soc_to_voltage(actual_stop_soc, ${battery_cells_s});
+            if (!isnan(actual_stop_v) && fabs(actual_stop_v - expected_stop_v) > 0.5f) {
+              id(cmd_stop_soc) = id(active_target_soc);
+              id(bi_charge_stop).execute(id(active_target_soc));
+              ESP_LOGW("watchdog", "⚠️ batt_stop_chg reset: %.1fV -> %.1fV", actual_stop_v, expected_stop_v);
+            }
+          }
+
+          // Idle: the cut-off must be back at the open ceiling, or PV cannot finish the
+          // pack. Catches a stop write the inverter rejected, a session that ended across
+          // a reboot, and anything set by hand. Rate-limited: if the inverter ever
+          // refuses this value too, retrying every cycle is exactly the ~2500
+          // EEPROM writes a day the old 58.4 V reset produced.
+          if (!id(charge_active) && !id(manual_charge_active) && !id(full_manual_mode)) {
+            static unsigned long last_open_fix_ms = 0;
+            // Backup keeps charging on SNU while idle: there the cut-off is its target, or
+            // the inverter's own charger would float the pack at 57.6 V (100%).
+            const float open_v = is_backup
+                ? blackout::charge_stop_voltage(${backup_target_soc}, ${battery_cells_s})
+                : blackout::max_stop_voltage(${battery_cells_s});
+            float actual_stop_soc = id(bi_ctl_stop_soc).state;
+            float actual_stop_v = isnan(actual_stop_soc) ? NAN
+                : blackout::soc_to_voltage(actual_stop_soc, ${battery_cells_s});
+            if (!isnan(actual_stop_v) && fabsf(actual_stop_v - open_v) > 0.5f &&
+                (last_open_fix_ms == 0 || millis() - last_open_fix_ms > 1800000UL)) {
+              last_open_fix_ms = millis();
+              id(active_stop_voltage) = open_v;
+              id(cmd_stop_soc) = is_backup ? ${backup_target_soc} : 100.0f;
+              id(bi_charge_stop).execute(id(cmd_stop_soc));
+              ESP_LOGW("watchdog", "⚠️ Idle cut-off %.1fV -> %.1fV (PV could not finish)",
+                       actual_stop_v, open_v);
+            }
+          }
+          
+          // ============ BATTERY PROTECTION ============
+          if (id(battery_protection_enabled)) {
+            // Overcharge protection: stop grid charging above critical_high_soc
+            if (soc >= ${critical_high_soc} && id(charge_active) && !id(manual_charge_active)) {
+              const bool aimed_at_top = id(active_target_soc) >= ${critical_high_soc};
+              stop_charge(soc, reserve);
+              char buf[100];
+              if (aimed_at_top) {
+                // A 100% session (outage plan) ends here by design: a plain completion,
+                // not a protection alarm every such night.
+                ESP_LOGI("charge", "✅ Full: %.1f%% (session aimed at the top)", soc);
+                snprintf(buf, sizeof(buf), "%.0f%% / %.1fV\nFull for the outages ahead", soc, voltage);
+                fire_throttled_event("charge_complete", "✅ Complete", buf);
+              } else {
+                ESP_LOGW("protection", "🔋 OVERCHARGE GUARD: %.1f%% >= %.0f%% - charge stopped", soc, (float)${critical_high_soc});
+                snprintf(buf, sizeof(buf), "Battery %.0f%% - charging stopped (protection)", soc);
+                fire_throttled_event("overcharge", "🔋 Overcharge Protection", buf, "high");
+              }
+            }
+
+            if (soc < ${critical_low_soc} && !id(charge_active) && id(grid_present)) {
+              if (id(manual_charge_active) && id(auto_disable_manual_charge)) {
+                id(manual_charge_active) = false;
+              }
+          
+              if (!id(manual_charge_active)) {
+                // By day the reserve is enough to get out of danger; the night target (bump,
+                // outage plan) is for the cheap rate.
+                start_charge_with_target(${charge_amps_critical}, is_night ? night_target : reserve);
+                ESP_LOGW("protection", "⛔ CRITICAL <%.0f%%: %.1f%%", ${critical_low_soc}, soc);
+          
+                char buf[100];
+                snprintf(buf, sizeof(buf), "Battery %.0f%%!\nEmergency charging %.0fA",
+                        soc, (float)${charge_amps_critical});
+
+                fire_throttled_event("critical", "⛔ CRITICAL!", buf, "high");
+              }
+            }
+          
+            if (soc >= ${critical_safe_soc} && id(notified_critical)) {
+              id(notified_critical) = false;
+            }
+          }
+          
+          // A grid charge session is pointless (and would just park the inverter in SUB)
+          // while the grid is down.
+          bool may_grid_charge = grid_ready() && can_auto_start() && !id(charge_active);
+
+          // ============ NIGHT CHARGE (23:00-07:00) ============
+          // Refill to the reserve on the cheap tariff. The old winter mode charged to
+          // 98% here every night regardless of need; the target is now the reserve plus
+          // a morning margin, capped at ${night_target_soc_max}%.
+          // clock_ok: without a date "night" is only an assumption, and charging the
+          // pack on that assumption could land squarely on the day tariff.
+          if (clock_ok && id(night_charge_automation_enabled) && is_night && may_grid_charge) {
+            // After the morning stop hour, a pack that already holds the reserve is left
+            // for the sun to finish rather than started on a fresh grid session.
+            bool past_safe_hour = (hour >= ${morning_stop_hour} && hour < ${night_end_hour});
+            bool already_safe = (soc >= reserve);
+
+            // Late in the night the threshold tightens, so the day starts at the target.
+            const float restart_hyst = (hour >= ${morning_topup_hour} && hour < ${night_end_hour})
+                ? ${reserve_restart_hysteresis_morning} : ${reserve_restart_hysteresis};
+            if (soc < night_target - restart_hyst && !(past_safe_hour && already_safe)) {
+              if (id(manual_charge_active)) id(manual_charge_active) = false;
+
+              float target = id(manual_charge_amps_number).state;
+              start_charge_with_target(target, night_target);
+              ESP_LOGI("night_charge", "🌙 START: %.1f%% → %.0f%% (reserve %.0f%%, %02d:00)",
+                       soc, night_target, reserve, hour);
+
+              char buf[150];
+              snprintf(buf, sizeof(buf), "%s %.0f%%→%.0f%% %.0fA\nReserve %.0f%% (%.0fh)",
+                       strategy_name(), soc, night_target, target, reserve, reserve_hours());
+              fire_throttled_event("night_start", "🌙 Night Charge", buf);
+              may_grid_charge = false;
+            }
+          }
+
+          // ============ POST-OUTAGE TOP-UP ============
+          // Armed when the grid comes back. Ignores the clock: under rolling blackouts
+          // there is no guarantee the night window will have power on it.
+          //
+          // By day it buys back the reserve and no more. It used to aim at the night
+          // target (peak reserve + margin + forecast bump) whatever the hour: grid back
+          // at 18:40 on 9 Oct bought 64%→74% at the day rate with the next outage a day
+          // away. After dark the night target is the right one — that is the cheap rate.
+          if (id(opportunistic_armed) && may_grid_charge
+              && soc < reserve - ${post_outage_min_deficit}) {
+            if (id(manual_charge_active)) id(manual_charge_active) = false;
+
+            float topup_target = is_night ? night_target : reserve;
+            start_charge_with_target(id(manual_charge_amps_number).state, topup_target);
+            ESP_LOGW("grid", "🔌 Post-outage top-up: %.1f%% → %.0f%%", soc, topup_target);
+
+            char buf[120];
+            snprintf(buf, sizeof(buf), "Grid back, battery %.0f%%\nCharging to %.0f%%", soc, topup_target);
+            fire_throttled_event("opportunistic", "🔌 Post-outage Charge", buf);
+            may_grid_charge = false;
+          }
+
+          // ============ OUTAGE PLAN TOP-UP ============
+          // By day, take the grid up to what HA's outage plan says the blocks ahead need,
+          // capped at night_target_soc_max. The plan already counts the sun and, if the
+          // night comes first, the night charge, so this only buys what neither covers.
+          // At night the plan is part of night_target_soc() instead.
+          {
+            float plan = plan_soc();
+            // Compare against the capped target, not the plan: with a 100% plan and SoC at
+            // 91% a session to 90% would start and end on every cycle.
+            float target = plan > ${night_target_soc_max} ? ${night_target_soc_max} : plan;
+            if (clock_ok && !is_night && !is_backup && plan > 0.0f && may_grid_charge
+                && soc < target - ${post_outage_min_deficit}) {
+              if (id(manual_charge_active)) id(manual_charge_active) = false;
+              start_charge_with_target(id(manual_charge_amps_number).state, target);
+              ESP_LOGW("plan", "📋 Outage plan top-up: %.1f%% → %.0f%%", soc, target);
+
+              char buf[120];
+              snprintf(buf, sizeof(buf), "Battery %.0f%%\nCharging to %.0f%% for the outages ahead",
+                       soc, target);
+              fire_throttled_event("plan_topup", "📋 Outage Plan Charge", buf);
+              may_grid_charge = false;
+            }
+          }
+
+          // ============ EMERGENCY REBUILD ============
+          // The reserve has actually been breached: below the hold band the battery is
+          // no longer able to cover the autonomy target, so charge regardless of the
+          // hour or the tariff. Inside the band nothing happens — the grid is already
+          // carrying the house, the drain has stopped, and the night window will refill
+          // the pack on the cheap rate.
+          //
+          // To make this fire earlier on purpose, raise Reserve Autonomy Target from
+          // Home Assistant: a bigger reserve puts SoC under the band and this triggers.
+          // That is how the outage-schedule automation asks for an early top-up, and it
+          // keeps every "is now a good time to buy" judgement on the HA side.
+          if (id(emergency_charge_automation_enabled) && !is_backup
+              && soc < hold_floor && may_grid_charge) {
+            if (id(manual_charge_active)) id(manual_charge_active) = false;
+
+            start_charge_with_target(${charge_amps_slow}, reserve);
+            ESP_LOGW("reserve", "⚠️ Reserve breached: %.1f%% < %.0f%% → %.0f%% @ %.0fA",
+                     soc, hold_floor, reserve, (float)${charge_amps_slow});
+
+            char buf[140];
+            snprintf(buf, sizeof(buf), "%s Battery %.0f%%, reserve %.0f%%\nTopping up @ %.0fA",
+                     strategy_name(), soc, reserve, (float)${charge_amps_slow});
+            fire_throttled_event("reserve_rebuild", "⚠️ Reserve Rebuild", buf, "high");
+            may_grid_charge = false;
+          }
+
+          // ============ BACKUP STRATEGY TOP-UP ============
+          // UPS behaviour: hold the pack high around the clock and take grid whenever
+          // it is there. Deliberately aggressive — this is the air-raid setting, not
+          // the everyday one.
+          if (is_backup && may_grid_charge && soc < (${backup_target_soc} - ${reserve_restart_hysteresis})) {
+            if (id(manual_charge_active)) id(manual_charge_active) = false;
+
+            start_charge_with_target(id(manual_charge_amps_number).state, ${backup_target_soc});
+            ESP_LOGW("backup", "🛡️ Top-up: %.1f%% → %.0f%%", soc, (float)${backup_target_soc});
+            may_grid_charge = false;
+          }
+
+          // ============ CHARGE COMPLETE ============
+          // One stop rule for every path above — each recorded its own target.
+          if (id(charge_active) && !id(manual_charge_active) && soc >= id(active_target_soc)) {
+            stop_charge(soc, reserve);
+            ESP_LOGI("charge", "✅ Target %.0f%% reached: %.1f%% / %.2fV",
+                     id(active_target_soc), soc, voltage);
+
+            char buf[110];
+            snprintf(buf, sizeof(buf), "%.0f%% / %.1fV\nReserve %.0f%% secured", soc, voltage, reserve);
+            fire_throttled_event("charge_complete", "✅ Complete", buf);
+          }
+          // Manual sessions end only with Auto-Disable on. Without it the switch is the
+          // user's to turn off, as before.
+          if (id(manual_charge_active) && id(auto_disable_manual_charge)
+              && soc >= id(active_target_soc)) {
+            ESP_LOGI("manual", "🔧 Manual Charge off: %.1f%% reached", soc);
+            id(manual_charge_switch).turn_off();
+            fire_throttled_event("manual_complete", "✅ Manual Complete", "Battery full");
+          }
+
+          // ============ MORNING STOP ============
+          // Hand over to the sun a couple of minutes into the morning.
+          static bool morning_stop_fired = false;
+          // From the stop minute to the end of that hour, not only in it: a cycle that bailed
+          // out early (stale Modbus, a restart at 07:01) used to let the night session run
+          // on at the day rate. Night sessions only: a rebuild, critical or Backup session
+          // started by day is not a night charge, and stopping it just restarted it.
+          // Any day hour from the stop time on: a session restored by a restart after 08:00
+          // still has to end.
+          if (clock_ok && !is_night && !(hour == ${morning_stop_hour} && minute < ${morning_stop_minute})
+              && id(charge_active) && !id(manual_charge_active) && id(session_night)
+              && !morning_stop_fired) {
+            morning_stop_fired = true;
+            stop_charge(soc, reserve);
+            ESP_LOGI("night_charge", "🌅 Morning stop: %.1f%% (solar will top up)", soc);
+
+            char buf[100];
+            snprintf(buf, sizeof(buf), "Morning: %.0f%%\nSolar will top up", soc);
+            fire_throttled_event("morning", "🌅 Morning", buf);
+          }
+          if (clock_ok && is_night) {
+            morning_stop_fired = false;
+          }
+
+          // ============ IDLE MODE ============
+          if (!id(charge_active) && !id(manual_charge_active)) {
+            static int idle_counter = 0;
+            if (idle_counter++ >= 2) {
+              apply_idle_modes(soc, reserve);
+              idle_counter = 0;
+            }
+          }
+
+
+          // ============ SMART RAMP-UP / GRID SAG REGULATION ============
+          // For the whole session, not only the ramp: below grid_voltage_min the current
+          // steps down, and climbs back toward the target once the grid is above
+          // grid_voltage_resume. It used to watch the voltage only while ramping, so a sag
+          // after the target was reached went unanswered: 198-200 V at 20 A for 7 min on
+          // 22 Oct, 196.5 V at 40 A on 2 Nov.
+          if (!id(charge_active)) {
+            // No session, but Backup idles in SNU at charge_amps_idle and the inverter tops
+            // the pack up from the grid on its own. Same guard, around charge_amps_idle.
+            float gv = id(grid_voltage_sensor).state;
+            float amps = id(bi_ctl_grid_charge_amps).state;
+            if (id(grid_present) && !isnan(gv) && gv >= 100 && !isnan(amps) &&
+                (id(bi_ctl_grid_charge_on).state == 1.0f)) {
+              // Same rules as a session: the minimum until the grid settles, the relay-trip
+              // cap, one step up per charge_ramp_step_s.
+              float top = ${charge_amps_idle};
+              if (id(relay_cap_amps) > 0.0f && id(relay_cap_amps) < top) top = id(relay_cap_amps);
+              const bool idle_step_due = millis() - id(last_step_ms) + 2000UL >= ${charge_ramp_step_s} * 1000UL;
+              float want = amps;
+              if (!grid_ready() || amps > top) {
+                want = std::min(amps, grid_ready() ? top : (float) ${charge_amps_start});
+              } else if (gv < ${grid_voltage_min} && amps > ${charge_amps_start}) {
+                want = std::max((float) ${charge_amps_start}, amps - (float) ${charge_amps_step});
+              } else if (gv >= ${grid_voltage_resume} && amps < top && idle_step_due) {
+                want = std::min(top, amps + (float) ${charge_amps_step});
+                id(last_step_up_ms) = millis();
+              }
+              if (want != amps) {
+                id(last_step_ms) = millis();
+                id(cmd_charge_amps) = want;
+                id(bi_charge_limit).execute(want);
+                ESP_LOGW("ramp", "%s Grid %.1fV (idle SNU): %.0fA → %.0fA",
+                         want < amps ? "⚠️" : "⬆️", gv, amps, want);
+                if (want < amps) {
+                  char buf[120];
+                  snprintf(buf, sizeof(buf), "Voltage %.0fV\nCurrent %.0fA", gv, want);
+                  fire_throttled_event("grid_voltage", "⚠️ Voltage Sag", buf, "high");
+                }
+              }
+            }
+            return;
+          }
+
+          float grid_voltage = id(grid_voltage_sensor).state;
+          float current = id(active_charge_amps);
+          float target = charge_target_amps();
+          // One step up per charge_ramp_step_s, and none that soon after a step down: the
+          // grid needs time to settle before the next +5 A is judged. 2 s of slack: the
+          // 30 s cycle drifts, and an exact 60 s test turned every other step into 90 s.
+          const bool step_due = millis() - id(last_step_ms) + 2000UL >= ${charge_ramp_step_s} * 1000UL;
+
+          if (isnan(grid_voltage) || grid_voltage < 100) {
+            return;
+          }
+
+          // Pause: the grid is back but not settled, or it is weak. Resume (stage 2) only once
+          // the line has held with the house on it (charge_stage_ready).
+          // Below grid_charge_pause_voltage the charge stops at once, whatever the current: stepping
+          // down from 40 A takes minutes right next to the relay's 190 V trip.
+          if (!grid_settled() || grid_voltage < ${grid_charge_pause_voltage}) {
+            if (!id(charge_paused) && grid_settled()) {
+              // A voltage pause of a running charge: the charge itself pulled the line down.
+              // Escalating hold, as for a weak grid, or it would resume and drop every ~3.5 min.
+              const bool repeat = id(vpause_since_ms) != 0 && millis() - id(vpause_since_ms) < 3600000UL;
+              uint32_t hold = repeat ? id(vpause_hold_ms) * 2UL : ${weak_grid_min_minutes} * 60000UL;
+              if (hold > ${weak_grid_max_minutes} * 60000UL) hold = ${weak_grid_max_minutes} * 60000UL;
+              id(vpause_hold_ms) = hold;
+              id(vpause_since_ms) = millis() | 1u;
+            }
+            if (!id(charge_paused)) {
+              write_charger_priority(false);
+              id(charge_paused) = true;
+              ESP_LOGW("ramp", "⏸️ Grid charge paused (%.0fV) until the grid settles", grid_voltage);
+            }
+            return;
+          }
+          if (id(charge_paused)) {
+            if (!charge_stage_ready()) return;
+            if (id(vpause_since_ms) != 0 && millis() - id(vpause_since_ms) < id(vpause_hold_ms)) return;
+            id(cmd_charge_amps) = (float) ${charge_amps_start};
+            id(bi_charge_limit).execute((float) ${charge_amps_start});
+            id(active_charge_amps) = ${charge_amps_start};
+            id(ramp_up_active) = true;
+            write_charger_priority(true);
+            id(charge_paused) = false;
+            id(last_step_ms) = millis();
+            id(last_step_up_ms) = millis();  // a loss right after this is the relay too
+            ESP_LOGI("ramp", "▶️ Line holds with the house on it — charging from %.0fA", (float) ${charge_amps_start});
+            return;
+          }
+
+          // Above the target (a relay-trip cap set mid-session, or a lowered target): down at once.
+          if (current > target) {
+            id(cmd_charge_amps) = target;
+            id(bi_charge_limit).execute(target);
+            id(active_charge_amps) = target;
+            id(ramp_up_active) = false;
+            id(last_step_ms) = millis();
+            ESP_LOGW("ramp", "⬇️ %.0fA → %.0fA (above target)", current, target);
+            return;
+          }
+
+          if (grid_voltage < ${grid_voltage_min}) {
+            float new_current = current - ${charge_amps_step};
+            if (new_current < ${charge_amps_start}) {
+              new_current = ${charge_amps_start};
+            }
+            // The register lives in the inverter's EEPROM: write only a real change.
+            if (new_current < current) {
+              id(cmd_charge_amps) = new_current;
+              id(bi_charge_limit).execute(new_current);
+              id(active_charge_amps) = new_current;
+              id(last_step_ms) = millis();
+            }
+            // Climb back from here once the grid recovers.
+            id(ramp_up_active) = true;
+            ESP_LOGW("ramp", "⚠️ Grid LOW: %.1fV → %.0fA", grid_voltage, new_current);
+
+            // Throttled grid voltage notification
+            char buf[120];
+            snprintf(buf, sizeof(buf), "Voltage %.0fV\nCurrent %.0fA", grid_voltage, new_current);
+            fire_throttled_event("grid_voltage", "⚠️ Voltage Sag", buf, "high");
+
+            return;
+          }
+
+          // Each +5 A (~270 W) pulls the grid down a few volts: climb only with headroom,
+          // or the current saws up and down across grid_voltage_min.
+          if (current < target && grid_voltage >= ${grid_voltage_resume} && step_due) {
+            id(last_step_ms) = millis();
+            id(last_step_up_ms) = millis();
+            float new_current = current + ${charge_amps_step};
+            if (new_current > target) {
+              new_current = target;
+            }
+          
+            id(cmd_charge_amps) = new_current;
+            id(bi_charge_limit).execute(new_current);
+          
+            id(active_charge_amps) = new_current;
+          
+            id(ramp_up_active) = new_current < target;
+            if (new_current >= target) {
+              ESP_LOGI("ramp", "✅ Target: %.0fA", new_current);
+            } else {
+              ESP_LOGI("ramp", "⬆️ %.0fA → %.0fA", current, new_current);
+            }
+          }
+

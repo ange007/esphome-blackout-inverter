@@ -1,0 +1,351 @@
+# Non-restored globals: cmd_* commanded state, hands_off, plus all non-restored
+
+# globals moved verbatim from esp8266-pv19.yaml. RTC-held state lives here too.
+
+globals:
+
+  - id: active_charge_amps
+    type: float
+    restore_value: no
+    initial_value: '5.0'
+
+
+  - id: ramp_up_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+
+  - id: notified_critical
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+
+  - id: notification_timers
+    type: std::map<std::string, unsigned long>
+    restore_value: no
+
+
+  - id: boot_notifications_suppressed
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+  # millis() of the last successful SoC read. Used to detect a silent Modbus bus
+  # (sensor holds its last value) and pause automation instead of acting on stale data.
+
+  - id: last_soc_update_ms
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+
+
+  - id: event_title
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+
+  - id: event_message
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+
+  - id: event_priority
+    type: std::string
+    restore_value: no
+    initial_value: '"normal"'
+
+
+  - id: event_id_str
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+
+  # Single source of truth for the charge stop voltage currently written to
+  # batt_stop_chg (20119). Set by start/manual/strategy logic, read by the watchdog
+  # and on_boot restore so they never fight the reserve-driven target.
+  # Default = open ceiling (blackout::CELL_V_MAX — see there for why not 3.65).
+
+  # State of the 24-hour load average ([EH] Daily Average Load). The live value is RAM
+  # only; `daily_load_saved_w` is its flash copy, refreshed only when the average moves
+  # by 20 W (roughly hourly), so a reboot resumes from yesterday's figure instead of
+  # restarting from whatever the house happens to draw at boot.
+  # Epoch seconds of the last write to Night Charge Bump. Restored with the bump itself,
+  # so a reboot keeps tonight's bump but a bump nobody refreshed expires on its own —
+  # see blackout::effective_night_bump.
+  # Why the SELF-HEAL interval last restarted the device: 0 none, 1 API dead, 2 WiFi
+  # dead, 3 Modbus dead, 4 nightly. Restored, so it survives the restart it explains.
+  # API/WiFi self-restarts in a row that did not help; reset once both are back.
+
+  - id: ha_absent_worst
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+
+  - id: prefs_flush_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+
+  - id: relay_trip_amps  # grid charge current when the grid dropped mid-charge; 0 = none pending
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+  - id: relay_cap_amps   # current cap until relay_cap_until_ms; 0 = none
+    type: float
+    restore_value: no
+    initial_value: '0'
+
+  - id: relay_cap_until_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: last_step_up_ms  # millis() of the last +charge_amps_step (session or Backup idle)
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: last_step_ms     # millis() of the last change of the grid charge current by the ramp
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: grid_back_ms     # millis() when the grid last came back; 0 = not since boot
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: grid_good_since_ms  # millis() since the grid voltage has been >= grid_stable_voltage; 0 = not
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: stage_wait_ms    # how long the voltage has to hold before charging; escalates on repeated losses
+    type: uint32_t
+    restore_value: no
+    initial_value: '${grid_stable_minutes} * 60000UL'
+
+  - id: weak_ok_since_ms  # millis() since the voltage has been >= weak_grid_voltage + clear margin; 0 = not
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: vpause_since_ms  # millis() of the last voltage pause of a session (charge pulled the line under 200 V)
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: vpause_hold_ms   # minimum pause after it; escalates like weak_hold_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '${weak_grid_min_minutes} * 60000UL'
+
+  - id: weak_hold_ms     # current minimum time on the battery (escalates on repeats)
+    type: uint32_t
+    restore_value: no
+    initial_value: '${weak_grid_min_minutes} * 60000UL'
+
+  - id: weak_cleared_ms  # millis() when weak_grid was last cleared (the house went back on the grid)
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: weak_grid_since_ms  # millis() when weak_grid was last set
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: weak_grid        # voltage fell below weak_grid_voltage and has not been stable since
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: grid_settle_ms   # how long that return (or the boot) has to hold before grid charging
+    type: uint32_t
+    restore_value: no
+    initial_value: '${grid_settle_minutes} * 60000UL'
+
+  - id: relay_trip_suspect  # the last loss came right after a step up
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # The session's grid charging is paused (charger priority OSO) until the grid settles.
+  # Kept here, not read back from the select: a modbus select reports a write only after
+  # its next poll, so the select alone cannot tell "paused" from "just started".
+
+  - id: charge_paused
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Manual Charge Auto-Disable on a grid loss is decided at the return: a short loss is the
+  # house relay that our own charging tripped, not the outage the manual charge was for.
+
+  - id: manual_off_pending
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # night_target_soc() of the last cycle, for the two limit sensors (one computation).
+
+  - id: night_target_now
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+
+
+  - id: daily_load_ema
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+
+
+  - id: hour_accum_w
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+
+  - id: hour_accum_samples
+    type: uint16_t
+    restore_value: no
+    initial_value: '0'
+
+
+  - id: last_profile_hour
+    type: int8_t
+    restore_value: no
+    initial_value: '-1'
+
+  # millis() of the last write to Reserve Autonomy Target. Not restored: after a reboot
+  # the override gets a fresh full TTL to be re-confirmed, which HA does on startup and
+  # every half hour anyway.
+
+  - id: reserve_hours_set_ms
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+
+  # ============ GRID PRESENCE / OUTAGE LOG ============
+
+  - id: grid_present
+    type: bool
+    restore_value: no
+    initial_value: 'true'
+
+
+  - id: grid_lost_ms
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+
+
+
+  - id: opportunistic_armed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Hysteresis state for the daytime soft-hold band. Kept as a latch rather than
+  # recomputed from SoC each cycle so the inverter cannot chatter on the threshold.
+
+  - id: hold_mode_active
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+
+  - id: last_mode_switch_ms
+    type: unsigned long
+    restore_value: no
+    initial_value: '0'
+
+  # ---- Kept across restarts in RTC memory, not flash (blackout::RtcState): a new
+  # ---- restored global would shift the flash slots of every switch/number/select after it.
+  # Saved with rtc_state_save() wherever they change, loaded in on_boot.
+  # Epoch of the last write to Reserve Autonomy Target. millis() alone gave the override a
+  # fresh 12 h TTL at every restart, so with HA dead (self-heal restarting every 20 min) it
+  # never expired. 0 = unknown (no clock at the write): the millis() stamp is used instead.
+
+  - id: reserve_hours_set_epoch
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+  # The running session was started at night: only those end at the morning stop.
+
+  - id: session_night
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # Modbus-silent self-restarts in a row; backs off like the API/WiFi ones.
+
+  - id: modbus_heal_streak
+    type: uint8_t
+    restore_value: no
+    initial_value: '0'
+
+  # on_boot has loaded the RtcState. Saves before that (Manual Charge's turn_on_action runs
+  # at switch setup, before on_boot) would overwrite it with the initial zeros.
+
+  - id: rtc_state_loaded
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # ---- Not restored ----
+  # The grid state has been read once since boot; before that grid_present is a guess.
+
+  - id: grid_seeded
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  # millis() when the running session started (the watchdog leaves a fresh one alone).
+
+  - id: session_start_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+
+  - id: cmd_house
+    type: int
+    restore_value: no
+    initial_value: '1'
+
+  - id: cmd_charge_amps
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: cmd_stop_soc
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: cmd_solar
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: cmd_discharge_stop
+    type: float
+    restore_value: no
+    initial_value: '0.0'
+
+  - id: bi_in_pass    # the main control pass is running (it calls bi_sync itself on exit)
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: settle_wait_ms  # stage 0 length for the next grid return; escalates on repeated losses
+    type: uint32_t
+    restore_value: no
+    initial_value: '${grid_settle_minutes} * 60000UL'
+  - id: hands_off
+    type: bool
+    restore_value: no
+    initial_value: 'false'
